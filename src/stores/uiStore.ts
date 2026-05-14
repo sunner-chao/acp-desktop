@@ -7,6 +7,7 @@ interface UIState {
   currentView: ViewMode;
   sidebarCollapsed: boolean;
   modalOpen: string | null;
+  modalData: unknown;
   agentDrawerCollapsed: boolean;
   protocolDrawerCollapsed: boolean;
   historyDrawerCollapsed: boolean;
@@ -16,7 +17,7 @@ interface UIState {
   toggleAgentDrawer: () => void;
   toggleProtocolDrawer: () => void;
   toggleHistoryDrawer: () => void;
-  openModal: (id: string) => void;
+  openModal: (id: string, data?: unknown) => void;
   closeModal: () => void;
 }
 
@@ -26,6 +27,7 @@ export const useUIStore = create<UIState>()(
       currentView: 'dashboard',
       sidebarCollapsed: false,
       modalOpen: null,
+      modalData: null,
       agentDrawerCollapsed: false,
       protocolDrawerCollapsed: false,
       historyDrawerCollapsed: false,
@@ -38,8 +40,8 @@ export const useUIStore = create<UIState>()(
         set((state) => ({ protocolDrawerCollapsed: !state.protocolDrawerCollapsed })),
       toggleHistoryDrawer: () =>
         set((state) => ({ historyDrawerCollapsed: !state.historyDrawerCollapsed })),
-      openModal: (id) => set({ modalOpen: id }),
-      closeModal: () => set({ modalOpen: null }),
+      openModal: (id, data) => set({ modalOpen: id, modalData: data ?? null }),
+      closeModal: () => set({ modalOpen: null, modalData: null }),
     }),
     {
       name: 'acp-desktop-ui-state',

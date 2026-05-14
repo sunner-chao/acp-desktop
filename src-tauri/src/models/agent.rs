@@ -49,6 +49,10 @@ pub struct AgentConfig {
     pub claude_env_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_launcher: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_enabled: Option<bool>,
 }
 
 /// 全局 Claude CLI 设置（用户可自定义）

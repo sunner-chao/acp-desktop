@@ -72,6 +72,26 @@ export default function AgentList() {
                       {agent.isOnline ? '停止' : '启动'}
                     </button>
                     <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openModal('edit-agent', agent);
+                      }}
+                      className="text-gray-500 hover:text-blue-400 text-sm"
+                      title="编辑"
+                    >
+                      ✎
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openModal('copy-agent', agent);
+                      }}
+                      className="text-gray-500 hover:text-green-400 text-sm"
+                      title="复制"
+                    >
+                      ⧉
+                    </button>
+                    <button
                       onClick={(e) => handleDelete(e, agent)}
                       className="text-gray-500 hover:text-red-400 text-sm"
                     >

@@ -5,10 +5,12 @@ import type { CreateAgentInput, DriverType } from '../../types';
 interface AgentFormProps {
   onClose: () => void;
   initialValues?: CreateAgentInput;
+  mode?: 'create' | 'edit' | 'copy';
+  editId?: string;
 }
 
-export default function AgentForm({ onClose, initialValues }: AgentFormProps) {
-  const { createAgent } = useAgentStore();
+export default function AgentForm({ onClose, initialValues, mode = 'create', editId }: AgentFormProps) {
+  const { createAgent, updateAgent } = useAgentStore();
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const [formData, setFormData] = useState<CreateAgentInput>(
@@ -36,10 +38,16 @@ export default function AgentForm({ onClose, initialValues }: AgentFormProps) {
 
     setIsSubmitting(true);
     try {
-      await createAgent(formData);
+      if (mode === 'edit' && editId) {
+        await updateAgent({ id: editId, ...formData });
+      } else {
+        await createAgent(formData);
+      }
       onClose();
     } catch (error) {
-      alert(`创建失败: ${error}`);
+      console.error('AgentForm submit error:', error);
+      console.error('Mode:', mode, 'FormData:', JSON.stringify(formData));
+      alert(`${mode === 'edit' ? '更新' : '创建'}失败: ${error}`);
     } finally {
       setIsSubmitting(false);
     }
@@ -193,6 +201,20 @@ export default function AgentForm({ onClose, initialValues }: AgentFormProps) {
               <h4 className="font-medium text-green-400 mb-3">本地 Claude CLI 设置</h4>
               <div className="space-y-3">
                 <div>
+                  <label className="block text-sm font-medium text-gray-400 mb-1">Launcher</label>
+                  <select
+                    value={formData.config.claudeLauncher || ''}
+                    onChange={(e) => updateConfig('claudeLauncher', e.target.value)}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-gray-100 text-sm focus:border-green-500 focus:outline-none"
+                  >
+                    <option value="">自动检测</option>
+                    <option value="claude-haha">claude-haha (默认)</option>
+                    <option value="claude-haha-dsv4">claude-haha-dsv4</option>
+                    <option value="claude-haha-minimax27">claude-haha-minimax27</option>
+                    <option value="claude-haha-glm51">claude-haha-glm51</option>
+                  </select>
+                </div>
+                <div>
                   <label className="block text-sm font-medium text-gray-400 mb-1">项目目录</label>
                   <input
                     type="text"
@@ -221,6 +243,18 @@ export default function AgentForm({ onClose, initialValues }: AgentFormProps) {
                     className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-gray-100 text-sm focus:border-green-500 focus:outline-none"
                     placeholder="claude-sonnet-4-6"
                   />
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="thinkingEnabled"
+                    checked={formData.config.thinkingEnabled || false}
+                    onChange={(e) => updateConfig('thinkingEnabled', e.target.checked)}
+                    className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-green-500 focus:ring-green-500"
+                  />
+                  <label htmlFor="thinkingEnabled" className="text-sm text-gray-400 cursor-pointer">
+                    启用思考模型 (Thinking)
+                  </label>
                 </div>
               </div>
             </div>
@@ -264,7 +298,7 @@ export default function AgentForm({ onClose, initialValues }: AgentFormProps) {
           disabled={isSubmitting}
           className="flex-1 px-4 py-2 bg-primary-600 hover:bg-primary-700 disabled:bg-gray-600 rounded-lg transition-colors"
         >
-          {isSubmitting ? '创建中...' : '创建智能体'}
+          {isSubmitting ? (mode === 'edit' ? '更新中...' : '创建中...') : (mode === 'edit' ? '保存修改' : '创建智能体')}
         </button>
         <button
           type="button"

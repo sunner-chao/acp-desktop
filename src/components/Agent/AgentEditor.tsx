@@ -1,12 +1,14 @@
 import { useAgentStore, useUIStore } from '../../stores';
 import AgentForm from './AgentForm';
 import LLMSettings from './LLMSettings';
+import type { Agent } from '../../types';
 
 export default function AgentEditor() {
   const { agents, selectedAgentId } = useAgentStore();
-  const { modalOpen, closeModal } = useUIStore();
+  const { modalOpen, modalData, closeModal } = useUIStore();
 
   const selectedAgent = agents.find((a) => a.id === selectedAgentId);
+  const editingAgent = modalData as Agent | undefined;
 
   if (modalOpen === 'create-agent') {
     return (
@@ -22,6 +24,63 @@ export default function AgentEditor() {
         </div>
         <div className="p-4">
           <AgentForm onClose={closeModal} />
+        </div>
+      </div>
+    );
+  }
+
+  if (modalOpen === 'edit-agent' && editingAgent) {
+    return (
+      <div className="bg-gray-800 rounded-lg border border-gray-700 h-full">
+        <div className="p-4 border-b border-gray-700 flex items-center justify-between">
+          <h3 className="font-semibold">编辑智能体</h3>
+          <button
+            onClick={closeModal}
+            className="text-gray-400 hover:text-gray-200"
+          >
+            ✕
+          </button>
+        </div>
+        <div className="p-4">
+          <AgentForm
+            onClose={closeModal}
+            editId={editingAgent.id}
+            initialValues={{
+              name: editingAgent.name,
+              description: editingAgent.description,
+              driverType: editingAgent.driverType,
+              config: editingAgent.config,
+            }}
+            mode="edit"
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (modalOpen === 'copy-agent' && editingAgent) {
+    return (
+      <div className="bg-gray-800 rounded-lg border border-gray-700 h-full">
+        <div className="p-4 border-b border-gray-700 flex items-center justify-between">
+          <h3 className="font-semibold">复制智能体</h3>
+          <button
+            onClick={closeModal}
+            className="text-gray-400 hover:text-gray-200"
+          >
+            ✕
+          </button>
+        </div>
+        <div className="p-4">
+          <AgentForm
+            onClose={closeModal}
+            initialValues={{
+              name: `${editingAgent.name} (副本)`,
+              description: editingAgent.description,
+              driverType: editingAgent.driverType,
+              config: editingAgent.config,
+            }}
+            mode="copy"
+          />
         </div>
       </div>
     );

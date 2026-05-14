@@ -22,6 +22,7 @@ interface ChatState {
   setIsSending: (isSending: boolean) => void;
   setIsStopping: (isStopping: boolean) => void;
   setAutoContinue: (autoContinue: boolean) => void;
+  updateMessageChunk: (messageId: string, chunk: string) => void;
   resetTransientState: () => void;
 }
 
@@ -53,6 +54,14 @@ export const useChatStore = create<ChatState>()(
       setIsSending: (isSending) => set({ isSending }),
       setIsStopping: (isStopping) => set({ isStopping }),
       setAutoContinue: (autoContinue) => set({ autoContinue }),
+      updateMessageChunk: (messageId, chunk) =>
+        set((state) => ({
+          chatMessages: state.chatMessages.map((msg) =>
+            msg.id === messageId
+              ? { ...msg, text: msg.text + chunk }
+              : msg
+          ),
+        })),
       resetTransientState: () =>
         set({
           chatMessages: [],

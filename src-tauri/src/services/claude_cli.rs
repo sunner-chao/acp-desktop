@@ -201,6 +201,9 @@ impl ClaudeCli {
                     args.push(session_id.to_string());
                 }
             }
+            if config.thinking_enabled.unwrap_or(false) {
+                args.push("--thinking".to_string());
+            }
 
             let mut child = Command::new("cmd")
                 .args(args)
@@ -297,11 +300,18 @@ impl ClaudeCli {
                 }
             }).unwrap_or_default();
 
+            let thinking_arg = if config.thinking_enabled.unwrap_or(false) {
+                " --thinking"
+            } else {
+                ""
+            };
+
             let bash_cmd = format!(
-                "echo '{}' | {} -p --verbose --bare --max-turns 1 --output-format stream-json --include-partial-messages --dangerously-skip-permissions{}",
+                "echo '{}' | {} -p --verbose --bare --max-turns 1 --output-format stream-json --include-partial-messages --dangerously-skip-permissions{}{}",
                 full_prompt.replace("'", "'\\''"),
                 launcher,
-                session_arg
+                session_arg,
+                thinking_arg
             );
             log::info!("[ClaudeCli] Full bash command: {}", bash_cmd);
 
@@ -497,6 +507,7 @@ fn clean_response(raw: &str) -> String {
 }
 
 fn resolve_launcher_command(config: &AgentConfig, default_env_file: &str) -> String {
+    // 1. 环境变量 ACP_CLAUDE_LAUNCHER 最高优先级
     if let Some(explicit) = std::env::var("ACP_CLAUDE_LAUNCHER")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -504,6 +515,15 @@ fn resolve_launcher_command(config: &AgentConfig, default_env_file: &str) -> Str
         return explicit;
     }
 
+    // 2. AgentConfig 中的 claude_launcher 字段（显式指定）
+    if let Some(launcher) = config.claude_launcher.as_deref() {
+        let trimmed = launcher.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    // 3. 从 claude_env_file 推断 launcher
     if let Some(explicit_env) = config.claude_env_file.as_deref() {
         let normalized = explicit_env.trim();
         if !normalized.is_empty() && normalized != ".env" {

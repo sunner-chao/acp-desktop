@@ -29,6 +29,8 @@ export interface AgentConfig {
   claudeProjectDir?: string;
   claudeEnvFile?: string;
   claudeModel?: string;
+  claudeLauncher?: string;  // 明确指定 launcher (如 claude-haha, claude-haha-dsv4)
+  thinkingEnabled?: boolean; // 启用思考模型
 }
 
 export interface ClaudeSettings {
