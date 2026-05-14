@@ -27,8 +27,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["msi", "nsis"],
-    "icon": []
+    "targets": "all",
+    "icon": [
+      "icons/icon.ico"
+    ]
   },
   "plugins": {
     "shell": {

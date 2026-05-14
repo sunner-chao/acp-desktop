@@ -119,10 +119,24 @@ fn resolve_claude_env_file(project_dir: &str) -> String {
     if bin_dir.join("claude-haha-dsv4.cmd").exists() || bin_dir.join("claude-haha-dsv4").exists() {
         return ".env.dsv4".to_string();
     }
+    if bin_dir.join("claude-haha-minimax27.cmd").exists() || bin_dir.join("claude-haha-minimax27").exists() {
+        return ".env.minimax27".to_string();
+    }
+    if bin_dir.join("claude-haha-glm51.cmd").exists() || bin_dir.join("claude-haha-glm51").exists() {
+        return ".env.glm51".to_string();
+    }
 
     let dsv4 = std::path::Path::new(project_dir).join(".env.dsv4");
     if dsv4.exists() {
         return ".env.dsv4".to_string();
+    }
+    let minimax27 = std::path::Path::new(project_dir).join(".env.minimax27");
+    if minimax27.exists() {
+        return ".env.minimax27".to_string();
+    }
+    let glm51 = std::path::Path::new(project_dir).join(".env.glm51");
+    if glm51.exists() {
+        return ".env.glm51".to_string();
     }
 
     let env = std::path::Path::new(project_dir).join(".env");
@@ -164,6 +178,8 @@ fn has_working_claude_launcher(project_dir: &std::path::Path) -> bool {
         "claude-haha-dsv4",
         "claude-haha-glm51.cmd",
         "claude-haha-glm51",
+        "claude-haha-minimax27.cmd",
+        "claude-haha-minimax27",
         "claude-haha.cmd",
         "claude-haha",
     ]
