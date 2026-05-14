@@ -1,0 +1,106 @@
+[
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440001",
+    "name": "code-reviewer",
+    "description": "代码审查专家，负责审查代码质量和安全漏洞",
+    "driverType": "llm",
+    "address": "agent://local/code-reviewer",
+    "config": {
+      "apiFormat": "anthropic",
+      "endpoint": "http://localhost:11434/v1/messages",
+      "apiKey": "sk-local-code-reviewer",
+      "model": "claude-sonnet-4-6",
+      "temperature": 0.3,
+      "maxTokens": 4096
+    },
+    "isOnline": false,
+    "lastActive": null,
+    "createdAt": "2026-05-14T10:00:00+08:00"
+  },
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440002",
+    "name": "game-strategist",
+    "description": "游戏攻略助手，专注 RPG 和策略游戏攻略分析",
+    "driverType": "llm",
+    "address": "agent://local/game-strategist",
+    "config": {
+      "apiFormat": "anthropic",
+      "endpoint": "http://localhost:11434/v1/messages",
+      "apiKey": "sk-local-game-strategist",
+      "model": "claude-haiku-4-5",
+      "temperature": 0.8,
+      "maxTokens": 2048
+    },
+    "isOnline": false,
+    "lastActive": null,
+    "createdAt": "2026-05-14T10:00:01+08:00"
+  },
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440003",
+    "name": "data-analyst",
+    "description": "数据分析师，负责数据统计、可视化和报表生成",
+    "driverType": "llm",
+    "address": "agent://local/data-analyst",
+    "config": {
+      "apiFormat": "openai",
+      "endpoint": "https://api.openai.com/v1/chat/completions",
+      "apiKey": "sk-your-openai-key-here",
+      "model": "gpt-4o",
+      "temperature": 0.2,
+      "maxTokens": 8192
+    },
+    "isOnline": false,
+    "lastActive": null,
+    "createdAt": "2026-05-14T10:00:02+08:00"
+  },
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440004",
+    "name": "translator",
+    "description": "多语言翻译专家，支持中英日韩互译",
+    "driverType": "script",
+    "address": "agent://local/translator",
+    "config": {
+      "scriptPath": "./scripts/translator.js",
+      "scriptType": "node"
+    },
+    "isOnline": false,
+    "lastActive": null,
+    "createdAt": "2026-05-14T10:00:03+08:00"
+  },
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440005",
+    "name": "security-auditor",
+    "description": "安全审计专家，检测代码安全漏洞和合规风险",
+    "driverType": "llm",
+    "address": "agent://local/security-auditor",
+    "config": {
+      "apiFormat": "anthropic",
+      "endpoint": "http://localhost:11434/v1/messages",
+      "apiKey": "sk-local-security-auditor",
+      "model": "claude-opus-4-6",
+      "temperature": 0.1,
+      "maxTokens": 8192
+    },
+    "isOnline": false,
+    "lastActive": null,
+    "createdAt": "2026-05-14T10:00:04+08:00"
+  },
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440006",
+    "name": "doc-writer",
+    "description": "技术文档撰写助手，生成 API 文档和 README",
+    "driverType": "llm",
+    "address": "agent://local/doc-writer",
+    "config": {
+      "apiFormat": "openai",
+      "endpoint": "https://api.minimaxi.com/anthropic",
+      "apiKey": "sk-your-minimax-key-here",
+      "model": "MiniMax-M2.7",
+      "temperature": 0.6,
+      "maxTokens": 4096
+    },
+    "isOnline": false,
+    "lastActive": null,
+    "createdAt": "2026-05-14T10:00:05+08:00"
+  }
+]

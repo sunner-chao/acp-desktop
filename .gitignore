@@ -1,0 +1,15 @@
+node_modules/
+dist/
+release/
+.DS_Store
+*.log
+*.tsbuildinfo
+coverage/
+.env
+.env.local
+.codex-run/
+.ds-code/
+build/certs/*.crt
+build/certs/*.key
+build/certs/*.pfx
+src-tauri/target/
