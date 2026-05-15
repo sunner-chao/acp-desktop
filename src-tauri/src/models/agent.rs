@@ -69,11 +69,21 @@ pub struct ClaudeSettings {
 
 impl Default for ClaudeSettings {
     fn default() -> Self {
+        Self::with_agent_config(None)
+    }
+}
+
+impl ClaudeSettings {
+    /// 从 agent 配置构建设置（可选），使用 agent 的 claudeProjectDir 优先
+    pub fn with_agent_config(agent_config: Option<&AgentConfig>) -> Self {
         let timeout_ms = std::env::var("ACP_CLAUDE_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(120000);
-        let project_dir = resolve_claude_project_dir();
+        let agent_project_dir = agent_config
+            .and_then(|c| c.claude_project_dir.as_deref())
+            .filter(|v| !v.trim().is_empty());
+        let project_dir = resolve_claude_project_dir(agent_project_dir);
         let env_file = resolve_claude_env_file(&project_dir);
         let entrypoint = resolve_claude_entrypoint(&project_dir);
 
@@ -89,11 +99,16 @@ impl Default for ClaudeSettings {
     }
 }
 
-fn resolve_claude_project_dir() -> String {
+fn resolve_claude_project_dir(agent_project_dir: Option<&str>) -> String {
     if let Ok(dir) = std::env::var("ACP_CLAUDE_PROJECT_DIR") {
         if !dir.trim().is_empty() {
             return canonicalize_string(&dir).unwrap_or(dir);
         }
+    }
+
+    // agent 配置的 claudeProjectDir 优先于目录扫描
+    if let Some(dir) = agent_project_dir {
+        return canonicalize_string(dir).unwrap_or_else(|| dir.to_string());
     }
 
     let candidates = [

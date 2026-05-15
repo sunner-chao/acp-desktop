@@ -23,9 +23,7 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::init();
-    log::info!("Starting ACP Desktop Agent Hub");
-
+    // 先占位，实际 log 在 setup 中初始化（因为需要 app_data_dir 路径）
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
@@ -34,6 +32,19 @@ pub fn run() {
                 .app_data_dir()
                 .expect("Failed to get app data dir");
             std::fs::create_dir_all(&app_dir).expect("Failed to create app data dir");
+
+            // 初始化 file-based logging
+            let log_path = app_dir.join("acp_desktop.log");
+            let log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .expect("Failed to open log file");
+            env_logger::Builder::from_default_env()
+                .target(env_logger::Target::Pipe(Box::new(log_file)))
+                .filter_level(log::LevelFilter::Info)
+                .init();
+            log::info!("Starting ACP Desktop Agent Hub, log at {:?}", log_path);
 
             let db_path = app_dir.join("acp_desktop.db");
             let db = Database::new(&db_path).expect("Failed to initialize database");

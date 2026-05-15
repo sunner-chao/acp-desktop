@@ -72,7 +72,7 @@ pub async fn invoke_claude_agent(
     state: State<'_, AppState>,
     input: InvokeClaudeInput,
 ) -> Result<ClaudeResponse, String> {
-    let settings = ClaudeSettings::default();
+    let settings = ClaudeSettings::with_agent_config(Some(&input.agent_config));
     let cli = ClaudeCli::new(settings);
 
     let system_prompt = input
@@ -192,7 +192,8 @@ pub async fn invoke_agent_group_chat(
     }
 
     let rounds = input.rounds.unwrap_or(1).clamp(1, 6);
-    let settings = ClaudeSettings::default();
+    let first_agent_config = input.agents.first().map(|a| &a.config);
+    let settings = ClaudeSettings::with_agent_config(first_agent_config);
     let cli = ClaudeCli::new(settings);
     let conversation_id = input
         .conversation_id
@@ -331,7 +332,18 @@ pub async fn invoke_agent_group_chat_stream(
     clear_cancelled_request(&state, &request_id);
 
     let rounds = input.rounds.unwrap_or(1).clamp(1, 6);
-    let settings = ClaudeSettings::default();
+    let first_agent_config = input.agents.first().map(|a| &a.config);
+    let settings = ClaudeSettings::with_agent_config(first_agent_config);
+
+    log::info!(
+        "[invoke_agent_group_chat_stream] request={}, rounds={}, agents={:?}, project_dir={}, env_file={}",
+        request_id,
+        rounds,
+        input.agents.iter().map(|a| format!("{}(id={})", a.name, a.id)).collect::<Vec<_>>(),
+        settings.project_dir,
+        settings.env_file
+    );
+
     let cli = ClaudeCli::new(settings);
     let conversation_id = input
         .conversation_id
