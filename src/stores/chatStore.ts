@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
-import type { ChatMessage } from '../types/chat';
+import type { ChatMessage, ConversationSnapshot } from '../types/chat';
 
 interface ChatState {
   chatMessages: ChatMessage[];
@@ -11,6 +11,9 @@ interface ChatState {
   isSending: boolean;
   isStopping: boolean;
   autoContinue: boolean;
+  autoContinueDelay: number;
+  chatMode: 'sequential' | 'parallel' | 'debate';
+  conversationCache: Record<string, ConversationSnapshot>;
 
   setChatMessages: (messages: ChatMessage[]) => void;
   appendChatMessages: (messages: ChatMessage[]) => void;
@@ -22,7 +25,11 @@ interface ChatState {
   setIsSending: (isSending: boolean) => void;
   setIsStopping: (isStopping: boolean) => void;
   setAutoContinue: (autoContinue: boolean) => void;
+  setAutoContinueDelay: (delay: number) => void;
+  setChatMode: (mode: 'sequential' | 'parallel' | 'debate') => void;
   updateMessageChunk: (messageId: string, chunk: string) => void;
+  switchConversation: (targetId: string | null) => void;
+  removeConversationFromCache: (id: string) => void;
   resetTransientState: () => void;
 }
 
@@ -37,6 +44,9 @@ export const useChatStore = create<ChatState>()(
       isSending: false,
       isStopping: false,
       autoContinue: false,
+      autoContinueDelay: 600,
+      chatMode: 'sequential',
+      conversationCache: {},
 
       setChatMessages: (messages) => set({ chatMessages: messages }),
       appendChatMessages: (messages) =>
@@ -53,7 +63,9 @@ export const useChatStore = create<ChatState>()(
       setConversationId: (conversationId) => set({ conversationId }),
       setIsSending: (isSending) => set({ isSending }),
       setIsStopping: (isStopping) => set({ isStopping }),
-      setAutoContinue: (autoContinue) => set({ autoContinue }),
+      setAutoContinue: (autoContinue: boolean) => set({ autoContinue }),
+      setAutoContinueDelay: (delay: number) => set({ autoContinueDelay: delay }),
+      setChatMode: (mode: 'sequential' | 'parallel' | 'debate') => set({ chatMode: mode }),
       updateMessageChunk: (messageId, chunk) =>
         set((state) => ({
           chatMessages: state.chatMessages.map((msg) =>
@@ -62,6 +74,40 @@ export const useChatStore = create<ChatState>()(
               : msg
           ),
         })),
+
+      switchConversation: (targetId) =>
+        set((state) => {
+          const nextCache = { ...state.conversationCache };
+          // Save current conversation UI state to cache
+          if (state.conversationId && state.conversationId !== targetId) {
+            nextCache[state.conversationId] = {
+              selectedAgentIds: state.selectedAgentIds,
+              inputText: state.inputText,
+              rounds: state.rounds,
+              autoContinue: state.autoContinue,
+            };
+          }
+
+          // Restore target conversation's UI state from cache, or defaults
+          const snapshot = targetId ? nextCache[targetId] : null;
+          return {
+            conversationId: targetId,
+            chatMessages: [], // Messages loaded from DB by caller
+            selectedAgentIds: snapshot?.selectedAgentIds ?? [],
+            inputText: snapshot?.inputText ?? '',
+            rounds: snapshot?.rounds ?? 1,
+            autoContinue: snapshot?.autoContinue ?? false,
+            conversationCache: nextCache,
+          };
+        }),
+
+      removeConversationFromCache: (id) =>
+        set((state) => {
+          const nextCache = { ...state.conversationCache };
+          delete nextCache[id];
+          return { conversationCache: nextCache };
+        }),
+
       resetTransientState: () =>
         set({
           chatMessages: [],
@@ -71,18 +117,24 @@ export const useChatStore = create<ChatState>()(
           isSending: false,
           isStopping: false,
           autoContinue: false,
+          autoContinueDelay: 600,
+          chatMode: 'sequential',
+          conversationCache: {},
         }),
     }),
     {
       name: 'acp-desktop-chat-state',
       storage: createJSONStorage(() => localStorage),
       partialize: (state) => ({
-        chatMessages: state.chatMessages,
         selectedAgentIds: state.selectedAgentIds,
         inputText: state.inputText,
         rounds: state.rounds,
         conversationId: state.conversationId,
         autoContinue: state.autoContinue,
+        autoContinueDelay: state.autoContinueDelay,
+        chatMode: state.chatMode,
+        conversationCache: state.conversationCache,
+        // chatMessages NOT persisted — loaded from DB
       }),
     }
   )

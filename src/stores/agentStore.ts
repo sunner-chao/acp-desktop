@@ -15,6 +15,7 @@ interface AgentState {
   startAgentSession: (id: string) => Promise<Agent>;
   stopAgentSession: (id: string) => Promise<Agent>;
   selectAgent: (id: string | null) => void;
+  resetAgents: () => void;
   importAgents: (json: string) => Promise<Agent[]>;
   exportAgents: () => string;
 }
@@ -111,6 +112,8 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   },
 
   selectAgent: (id) => set({ selectedAgentId: id }),
+
+  resetAgents: () => set({ agents: [], selectedAgentId: null, error: null }),
 
   importAgents: async (json) => {
     const agents = await invoke<Agent[]>('import_agents', { json });

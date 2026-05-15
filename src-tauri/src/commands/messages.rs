@@ -4,18 +4,12 @@ use rusqlite::params;
 use tauri::State;
 use uuid::Uuid;
 
-fn generate_conversation_id(sender: &str, receiver: &str) -> String {
-    let mut parts = vec![sender, receiver];
-    parts.sort();
-    Uuid::new_v5(&Uuid::NAMESPACE_URL, parts.join(":").as_bytes()).to_string()
-}
-
 #[tauri::command]
 pub fn send_message(state: State<AppState>, input: SendMessageInput) -> Result<ACPMessage, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
 
     let id = Uuid::new_v4().to_string();
-    let conversation_id = generate_conversation_id(&input.sender, &input.receiver);
+    let conversation_id = input.conversation_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let timestamp = chrono::Utc::now().to_rfc3339();
 
     let message = ACPMessage {

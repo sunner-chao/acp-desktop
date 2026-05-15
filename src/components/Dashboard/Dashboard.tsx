@@ -1,9 +1,10 @@
-import { useAgentStore, useMessageStore } from '../../stores';
+import { useAgentStore, useConversationStore, useMessageStore } from '../../stores';
 import AgentCard from './AgentCard';
 
 export default function Dashboard() {
   const { agents } = useAgentStore();
-  const { messages, conversations } = useMessageStore();
+  const { conversations } = useConversationStore();
+  const { messages } = useMessageStore();
 
   const onlineCount = agents.filter((a) => a.isOnline).length;
   const offlineCount = agents.length - onlineCount;

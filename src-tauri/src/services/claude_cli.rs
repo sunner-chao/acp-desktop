@@ -40,6 +40,34 @@ fn resolve_env_file(config: &AgentConfig, default_env_file: &str) -> String {
     default_env_file.to_string()
 }
 
+/// 读取 .env 文件并显式设置到 Command，确保覆盖父进程继承的环境变量
+fn load_env_file_to_command(cmd: &mut Command, project_dir: &str, env_file: &str) {
+    let env_path = std::path::Path::new(project_dir).join(env_file);
+    if let Ok(content) = std::fs::read_to_string(&env_path) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            // 跳过空行和注释
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            // 解析 KEY=VALUE
+            if let Some(eq_pos) = trimmed.find('=') {
+                let key = trimmed[..eq_pos].trim();
+                let value = trimmed[eq_pos + 1..].trim();
+                if !key.is_empty() {
+                    cmd.env(key, value);
+                }
+            }
+        }
+        log::info!(
+            "[ClaudeCli] Loaded env vars from {} (overriding inherited env)",
+            env_path.display()
+        );
+    } else {
+        log::warn!("[ClaudeCli] Failed to read env file: {}", env_path.display());
+    }
+}
+
 /// 在 Windows 上启动 Claude CLI 子进程，直接调用 bun（绕过 cmd /C 避免 stdin 转发问题）
 /// 返回 (child, pid)
 #[cfg(target_os = "windows")]
@@ -90,6 +118,9 @@ fn spawn_cli_process(
     };
     #[cfg(not(target_os = "windows"))]
     let mut cmd = Command::new(&settings.command);
+
+    // 显式加载 env 文件，覆盖父进程继承的污染变量
+    load_env_file_to_command(&mut cmd, &settings.project_dir, env_file);
 
     let mut child = cmd
         .args(&args)

@@ -10,3 +10,10 @@ export interface ChatMessage {
   isLoading?: boolean;
   acpMessage?: ACPMessage;
 }
+
+export interface ConversationSnapshot {
+  selectedAgentIds: string[];
+  inputText: string;
+  rounds: number;
+  autoContinue: boolean;
+}

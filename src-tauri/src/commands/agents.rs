@@ -175,12 +175,20 @@ pub fn update_agent(state: State<AppState>, input: UpdateAgentInput) -> Result<A
         })
         .map_err(|e| e.to_string())?;
 
+    let has_new_name = input.name.is_some();
+    let new_name = input.name.unwrap_or(agent.name.clone());
+    let new_address = if has_new_name {
+        format!("agent://local/{}", new_name)
+    } else {
+        agent.address.clone()
+    };
+
     let updated_agent = Agent {
         id: agent.id,
-        name: input.name.unwrap_or(agent.name),
+        name: new_name,
         description: input.description.or(agent.description),
         driver_type: agent.driver_type,
-        address: agent.address,
+        address: new_address,
         config: input.config.unwrap_or(agent.config),
         is_online: agent.is_online,
         session_id: agent.session_id,
@@ -190,11 +198,12 @@ pub fn update_agent(state: State<AppState>, input: UpdateAgentInput) -> Result<A
 
     db.get_connection()
         .execute(
-            "UPDATE agents SET name = ?1, description = ?2, config = ?3 WHERE id = ?4",
+            "UPDATE agents SET name = ?1, description = ?2, config = ?3, address = ?4 WHERE id = ?5",
             rusqlite::params![
                 updated_agent.name,
                 updated_agent.description,
                 serde_json::to_string(&updated_agent.config).unwrap(),
+                updated_agent.address,
                 updated_agent.id,
             ],
         )

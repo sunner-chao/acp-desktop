@@ -44,6 +44,7 @@ pub struct InvokeAgentGroupChatInput {
     pub rounds: Option<u32>,
     pub conversation_id: Option<String>,
     pub request_id: Option<String>,
+    pub chat_mode: Option<String>, // "sequential" | "parallel" | "debate"
 }
 
 #[derive(Debug, Serialize)]
@@ -205,6 +206,29 @@ pub async fn invoke_agent_group_chat(
     let mut emitted = history.clone();
     let persisted_len = history.len();
 
+    // Ensure conversation row exists in DB
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let exists: bool = db
+            .get_connection()
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM conversations WHERE id = ?1",
+                [&conversation_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            let default_title = format!("Multi-agent chat ({})", &now[11..19]);
+            let agent_ids_json =
+                serde_json::to_string(&input.agents.iter().map(|a| a.id.clone()).collect::<Vec<_>>())
+                    .unwrap();
+            let _ = db.get_connection().execute(
+                "INSERT INTO conversations (id, title, selected_agent_ids, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![conversation_id, default_title, agent_ids_json, now, now],
+            );
+        }
+    }
+
     let mut session_cache = std::collections::HashMap::<String, (String, bool, usize)>::new();
     {
         let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -307,6 +331,11 @@ pub async fn invoke_agent_group_chat(
                 ],
             );
         }
+        // Update conversation timestamp
+        let _ = db.get_connection().execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![chrono::Utc::now().to_rfc3339(), conversation_id],
+        );
     }
 
     Ok(GroupChatResponse {
@@ -331,15 +360,17 @@ pub async fn invoke_agent_group_chat_stream(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     clear_cancelled_request(&state, &request_id);
 
+    let chat_mode = input.chat_mode.clone().unwrap_or_else(|| "sequential".to_string());
     let rounds = input.rounds.unwrap_or(1).clamp(1, 6);
     let first_agent_config = input.agents.first().map(|a| &a.config);
     let settings = ClaudeSettings::with_agent_config(first_agent_config);
 
     log::info!(
-        "[invoke_agent_group_chat_stream] request={}, rounds={}, agents={:?}, project_dir={}, env_file={}",
+        "[invoke_agent_group_chat_stream] request={}, mode={}, rounds={}, agents={}, project_dir={}, env_file={}",
         request_id,
+        chat_mode,
         rounds,
-        input.agents.iter().map(|a| format!("{}(id={})", a.name, a.id)).collect::<Vec<_>>(),
+        input.agents.iter().map(|a| format!("{}(id={})", a.name, a.id)).collect::<Vec<_>>().join(", "),
         settings.project_dir,
         settings.env_file
     );
@@ -354,6 +385,29 @@ pub async fn invoke_agent_group_chat_stream(
     let history = load_conversation_history(&state, &conversation_id)?;
     let mut emitted = history.clone();
     let persisted_len = history.len();
+
+    // Ensure conversation row exists in DB
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let exists: bool = db
+            .get_connection()
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM conversations WHERE id = ?1",
+                [&conversation_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            let default_title = format!("Multi-agent chat ({})", &now[11..19]);
+            let agent_ids_json =
+                serde_json::to_string(&input.agents.iter().map(|a| a.id.clone()).collect::<Vec<_>>())
+                    .unwrap();
+            let _ = db.get_connection().execute(
+                "INSERT INTO conversations (id, title, selected_agent_ids, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![conversation_id, default_title, agent_ids_json, now, now],
+            );
+        }
+    }
 
     let mut session_cache = std::collections::HashMap::<String, (String, bool, usize)>::new();
     {
@@ -397,157 +451,697 @@ pub async fn invoke_agent_group_chat_stream(
     );
 
     'rounds: for round in 1..=rounds {
-        for agent in &input.agents {
-            if is_request_cancelled(&state, &request_id) {
-                break 'rounds;
-            }
+        if is_request_cancelled(&state, &request_id) {
+            break 'rounds;
+        }
 
-            let (session_id, is_new, last_seen) = session_cache
-                .get(&agent.id)
-                .cloned()
-                .ok_or_else(|| format!("{} 缺少会话上下文", agent.name))?;
-            let transcript = build_group_transcript(&emitted[last_seen..]);
-            let prompt = format!(
-                "You are participating in a multi-agent ACP group conversation.\n\nNew ACP messages since your last turn:\n{}\n\nNow respond as {}. Address the other agents when useful, keep the reply focused, and do not invent messages for anyone else.",
-                transcript, agent.name
-            );
-            let system_prompt = agent
-                .description
-                .clone()
-                .unwrap_or_else(|| "An AI agent in the ACP network.".to_string());
+        match chat_mode.as_str() {
+            "parallel" => {
+                // Parallel mode: all agents respond simultaneously using the same transcript snapshot
+                let snapshot_len = emitted.len();
+                let mut round_results: Vec<(usize, String, String, bool, String)> = Vec::new(); // (agent_idx, session_id, message_id, response_text)
 
-            let message_id = Uuid::new_v4().to_string();
-            let _ = app.emit(
-                "group-chat-stream",
-                GroupChatStreamEvent {
-                    request_id: request_id.clone(),
-                    conversation_id: conversation_id.clone(),
-                    message_id: Some(message_id.clone()),
-                    agent_id: Some(agent.id.clone()),
-                    speaker: Some(agent.name.clone()),
-                    round: Some(round),
-                    chunk: None,
-                    message: None,
-                    status: "start".to_string(),
-                },
-            );
+                for (idx, agent) in input.agents.iter().enumerate() {
+                    let (session_id, is_new, last_seen) = session_cache
+                        .get(&agent.id)
+                        .cloned()
+                        .ok_or_else(|| format!("{} 缺少会话上下文", agent.name))?;
+                    // All agents see the same transcript up to the round start
+                    let transcript = build_group_transcript(&emitted[last_seen..snapshot_len.min(emitted.len())]);
+                    let prompt = format!(
+                        "You are participating in a multi-agent ACP group conversation (parallel mode — all agents respond at once).\n\nCurrent conversation:\n{}\n\nNow respond as {}. Be concise and address the topic directly.",
+                        transcript, agent.name
+                    );
+                    let system_prompt = agent
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| "An AI agent in the ACP network.".to_string());
 
-            let response_text = cli.invoke_streaming(
-                &agent.config,
-                &prompt,
-                &system_prompt,
-                Some(session_id.as_str()),
-                !is_new,
-                {
-                    let state = &state;
-                    let request_id = request_id.clone();
-                    move |pid| {
-                        state
-                            .active_chat_processes
-                            .lock()
-                            .map_err(|e| ClaudeCliError::Process(e.to_string()))?
-                            .insert(request_id.clone(), pid);
-                        Ok(())
-                    }
-                },
-                {
-                    let state = &state;
-                    let request_id = request_id.clone();
-                    move || {
-                        state
-                            .active_chat_processes
-                            .lock()
-                            .map_err(|e| ClaudeCliError::Process(e.to_string()))?
-                            .remove(&request_id);
-                        Ok(())
-                    }
-                },
-                {
-                    let state = &state;
-                    let request_id = request_id.clone();
-                    move || is_request_cancelled(state, &request_id)
-                },
-                {
-                    let app = app.clone();
-                    let request_id = request_id.clone();
-                    let conversation_id = conversation_id.clone();
-                    let message_id = message_id.clone();
-                    let agent_id = agent.id.clone();
-                    let speaker = agent.name.clone();
-                    move |chunk| {
-                        app.emit(
-                            "group-chat-stream",
-                            GroupChatStreamEvent {
-                                request_id: request_id.clone(),
-                                conversation_id: conversation_id.clone(),
-                                message_id: Some(message_id.clone()),
-                                agent_id: Some(agent_id.clone()),
-                                speaker: Some(speaker.clone()),
-                                round: Some(round),
-                                chunk: Some(chunk.to_string()),
-                                message: None,
-                                status: "chunk".to_string(),
-                            },
-                        )
-                        .map_err(|e| ClaudeCliError::Process(e.to_string()))
-                    }
-                },
-            );
+                    let message_id = Uuid::new_v4().to_string();
+                    let _ = app.emit(
+                        "group-chat-stream",
+                        GroupChatStreamEvent {
+                            request_id: request_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                            message_id: Some(message_id.clone()),
+                            agent_id: Some(agent.id.clone()),
+                            speaker: Some(agent.name.clone()),
+                            round: Some(round),
+                            chunk: None,
+                            message: None,
+                            status: "start".to_string(),
+                        },
+                    );
 
-            let response_text = match response_text {
-                Ok(text) => text,
-                Err(ClaudeCliError::Cancelled) => break 'rounds,
-                Err(error) => return Err(format!("{} 调用失败: {}", agent.name, error)),
-            };
+                    // For parallel: use invoke (non-streaming) to avoid interleaved chunks
+                    let response_result = cli.invoke(
+                        &agent.config,
+                        &prompt,
+                        &system_prompt,
+                        Some(session_id.as_str()),
+                        !is_new,
+                    );
 
-            if response_text.trim().is_empty() {
-                if is_request_cancelled(&state, &request_id) {
-                    break 'rounds;
+                    let response_text = match response_result {
+                        Ok(text) => text,
+                        Err(ClaudeCliError::Cancelled) => break 'rounds,
+                        Err(error) => format!("[错误] {} 调用失败: {}", agent.name, error),
+                    };
+
+                    round_results.push((idx, session_id, message_id, is_new, response_text));
                 }
-                continue;
+
+                // Emit all results
+                for (idx, session_id, message_id, is_new, response_text) in round_results {
+                    let agent = &input.agents[idx];
+                    let text_to_use = if response_text.trim().is_empty() {
+                        if is_request_cancelled(&state, &request_id) { break 'rounds; }
+                        continue;
+                    } else {
+                        response_text
+                    };
+
+                    let msg = ACPMessage {
+                        id: message_id.clone(),
+                        performative: ACPPerformative::Inform,
+                        sender: agent.address.clone(),
+                        receiver: group_address.clone(),
+                        content: ACPContent {
+                            action: Some("group_chat_turn".to_string()),
+                            parameters: None,
+                            result: Some(serde_json::json!({"text": text_to_use})),
+                            reason: None,
+                        },
+                        conversation_id: conversation_id.clone(),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        metadata: Some(serde_json::json!({
+                            "round": round,
+                            "agentId": agent.id,
+                            "speaker": agent.name,
+                            "mode": "parallel"
+                        })),
+                    };
+                    emitted.push(msg.clone());
+                    let _ = app.emit(
+                        "group-chat-stream",
+                        GroupChatStreamEvent {
+                            request_id: request_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                            message_id: Some(message_id),
+                            agent_id: Some(agent.id.clone()),
+                            speaker: Some(agent.name.clone()),
+                            round: Some(round),
+                            chunk: None,
+                            message: Some(msg),
+                            status: "message".to_string(),
+                        },
+                    );
+
+                    {
+                        let db = state.db.lock().map_err(|e| e.to_string())?;
+                        let _ = persist_agent_session_id(&db, &agent.id, &session_id);
+                    }
+                    session_cache.insert(agent.id.clone(), (session_id, false, emitted.len()));
+                }
             }
+            "debate" => {
+                // Debate mode: agents alternate, each prompted to challenge or build on the previous speaker
+                for agent in &input.agents {
+                    if is_request_cancelled(&state, &request_id) {
+                        break 'rounds;
+                    }
 
-            let msg = ACPMessage {
-                id: message_id.clone(),
-                performative: ACPPerformative::Inform,
-                sender: agent.address.clone(),
-                receiver: group_address.clone(),
-                content: ACPContent {
-                    action: Some("group_chat_turn".to_string()),
-                    parameters: None,
-                    result: Some(serde_json::json!({"text": response_text})),
-                    reason: None,
-                },
-                conversation_id: conversation_id.clone(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                metadata: Some(serde_json::json!({
-                    "round": round,
-                    "agentId": agent.id,
-                    "speaker": agent.name
-                })),
-            };
-            emitted.push(msg.clone());
-            let _ = app.emit(
-                "group-chat-stream",
-                GroupChatStreamEvent {
-                    request_id: request_id.clone(),
-                    conversation_id: conversation_id.clone(),
-                    message_id: Some(message_id),
-                    agent_id: Some(agent.id.clone()),
-                    speaker: Some(agent.name.clone()),
-                    round: Some(round),
-                    chunk: None,
-                    message: Some(msg),
-                    status: "message".to_string(),
-                },
-            );
+                    let (session_id, is_new, last_seen) = session_cache
+                        .get(&agent.id)
+                        .cloned()
+                        .ok_or_else(|| format!("{} 缺少会话上下文", agent.name))?;
+                    let transcript = build_group_transcript(&emitted[last_seen..]);
+                    let last_speaker = emitted.last()
+                        .and_then(|m| m.metadata.as_ref())
+                        .and_then(|m| m.get("speaker"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("user");
+                    let debate_prompt = format!(
+                        "You are in a debate-style multi-agent conversation.\n\nConversation so far:\n{}\n\nThe last speaker was '{}'. Now it is your turn as {}.\n\nRules: Engage critically with the previous speaker's points. You may agree, disagree, or offer an alternative perspective — but you must engage with what was said, not just state your own view independently. Be concise and constructive.",
+                        transcript, last_speaker, agent.name
+                    );
+                    let system_prompt = agent
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| "An AI agent in the ACP network.".to_string());
 
-            {
-                let db = state.db.lock().map_err(|e| e.to_string())?;
-                let _ = persist_agent_session_id(&db, &agent.id, &session_id);
+                    let message_id = Uuid::new_v4().to_string();
+                    let _ = app.emit(
+                        "group-chat-stream",
+                        GroupChatStreamEvent {
+                            request_id: request_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                            message_id: Some(message_id.clone()),
+                            agent_id: Some(agent.id.clone()),
+                            speaker: Some(agent.name.clone()),
+                            round: Some(round),
+                            chunk: None,
+                            message: None,
+                            status: "start".to_string(),
+                        },
+                    );
+
+                    let response_text = cli.invoke_streaming(
+                        &agent.config,
+                        &debate_prompt,
+                        &system_prompt,
+                        Some(session_id.as_str()),
+                        !is_new,
+                        {
+                            let state = &state;
+                            let request_id = request_id.clone();
+                            move |pid| {
+                                state
+                                    .active_chat_processes
+                                    .lock()
+                                    .map_err(|e| ClaudeCliError::Process(e.to_string()))?
+                                    .insert(request_id.clone(), pid);
+                                Ok(())
+                            }
+                        },
+                        {
+                            let state = &state;
+                            let request_id = request_id.clone();
+                            move || {
+                                state
+                                    .active_chat_processes
+                                    .lock()
+                                    .map_err(|e| ClaudeCliError::Process(e.to_string()))?
+                                    .remove(&request_id);
+                                Ok(())
+                            }
+                        },
+                        {
+                            let state = &state;
+                            let request_id = request_id.clone();
+                            move || is_request_cancelled(state, &request_id)
+                        },
+                        {
+                            let app = app.clone();
+                            let request_id = request_id.clone();
+                            let conversation_id = conversation_id.clone();
+                            let message_id = message_id.clone();
+                            let agent_id = agent.id.clone();
+                            let speaker = agent.name.clone();
+                            move |chunk| {
+                                app.emit(
+                                    "group-chat-stream",
+                                    GroupChatStreamEvent {
+                                        request_id: request_id.clone(),
+                                        conversation_id: conversation_id.clone(),
+                                        message_id: Some(message_id.clone()),
+                                        agent_id: Some(agent_id.clone()),
+                                        speaker: Some(speaker.clone()),
+                                        round: Some(round),
+                                        chunk: Some(chunk.to_string()),
+                                        message: None,
+                                        status: "chunk".to_string(),
+                                    },
+                                )
+                                .map_err(|e| ClaudeCliError::Process(e.to_string()))
+                            }
+                        },
+                    );
+
+                    let response_text = match response_text {
+                        Ok(text) => text,
+                        Err(ClaudeCliError::Cancelled) => break 'rounds,
+                        Err(error) => {
+                            let error_text = format!("[错误] {} 调用失败: {}", agent.name, error);
+                            let msg = ACPMessage {
+                                id: message_id.clone(),
+                                performative: ACPPerformative::Inform,
+                                sender: agent.address.clone(),
+                                receiver: group_address.clone(),
+                                content: ACPContent {
+                                    action: Some("group_chat_turn".to_string()),
+                                    parameters: None,
+                                    result: Some(serde_json::json!({"text": error_text})),
+                                    reason: None,
+                                },
+                                conversation_id: conversation_id.clone(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                metadata: Some(serde_json::json!({
+                                    "round": round,
+                                    "agentId": agent.id,
+                                    "speaker": agent.name,
+                                    "mode": "debate"
+                                })),
+                            };
+                            emitted.push(msg.clone());
+                            let _ = app.emit(
+                                "group-chat-stream",
+                                GroupChatStreamEvent {
+                                    request_id: request_id.clone(),
+                                    conversation_id: conversation_id.clone(),
+                                    message_id: Some(message_id),
+                                    agent_id: Some(agent.id.clone()),
+                                    speaker: Some(agent.name.clone()),
+                                    round: Some(round),
+                                    chunk: None,
+                                    message: Some(msg),
+                                    status: "message".to_string(),
+                                },
+                            );
+                            continue;
+                        }
+                    };
+
+                    if response_text.trim().is_empty() {
+                        if is_request_cancelled(&state, &request_id) {
+                            break 'rounds;
+                        }
+                        continue;
+                    }
+
+                    let msg = ACPMessage {
+                        id: message_id.clone(),
+                        performative: ACPPerformative::Inform,
+                        sender: agent.address.clone(),
+                        receiver: group_address.clone(),
+                        content: ACPContent {
+                            action: Some("group_chat_turn".to_string()),
+                            parameters: None,
+                            result: Some(serde_json::json!({"text": response_text})),
+                            reason: None,
+                        },
+                        conversation_id: conversation_id.clone(),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        metadata: Some(serde_json::json!({
+                            "round": round,
+                            "agentId": agent.id,
+                            "speaker": agent.name,
+                            "mode": "debate"
+                        })),
+                    };
+                    emitted.push(msg.clone());
+                    let _ = app.emit(
+                        "group-chat-stream",
+                        GroupChatStreamEvent {
+                            request_id: request_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                            message_id: Some(message_id),
+                            agent_id: Some(agent.id.clone()),
+                            speaker: Some(agent.name.clone()),
+                            round: Some(round),
+                            chunk: None,
+                            message: Some(msg),
+                            status: "message".to_string(),
+                        },
+                    );
+
+                    {
+                        let db = state.db.lock().map_err(|e| e.to_string())?;
+                        let _ = persist_agent_session_id(&db, &agent.id, &session_id);
+                    }
+                    session_cache.insert(agent.id.clone(), (session_id, false, emitted.len()));
+                }
             }
+            _ => {
+                // Sequential mode (default): agents respond one by one, each seeing previous responses
+                for agent in &input.agents {
+                    if is_request_cancelled(&state, &request_id) {
+                        break 'rounds;
+                    }
 
-            session_cache.insert(agent.id.clone(), (session_id, false, emitted.len()));
+                    let (session_id, is_new, last_seen) = session_cache
+                        .get(&agent.id)
+                        .cloned()
+                        .ok_or_else(|| format!("{} 缺少会话上下文", agent.name))?;
+                    let transcript = build_group_transcript(&emitted[last_seen..]);
+                    let prompt = format!(
+                        "You are participating in a multi-agent ACP group conversation.\n\nNew ACP messages since your last turn:\n{}\n\nNow respond as {}. Address the other agents when useful, keep the reply focused, and do not invent messages for anyone else.",
+                        transcript, agent.name
+                    );
+                    let system_prompt = agent
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| "An AI agent in the ACP network.".to_string());
+
+                    let message_id = Uuid::new_v4().to_string();
+                    let _ = app.emit(
+                        "group-chat-stream",
+                        GroupChatStreamEvent {
+                            request_id: request_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                            message_id: Some(message_id.clone()),
+                            agent_id: Some(agent.id.clone()),
+                            speaker: Some(agent.name.clone()),
+                            round: Some(round),
+                            chunk: None,
+                            message: None,
+                            status: "start".to_string(),
+                        },
+                    );
+
+                    // NOTE: We intentionally do NOT compact before resume.
+                    // In -p (pipe) mode, sending a compact prompt to the same session
+                    // only APPENDS to the history — it cannot replace it. This makes
+                    // the context even longer and causes duplicate content in responses.
+                    // Instead, we rely on the retry-with-fresh-session mechanism below
+                    // when the session context is too long.
+
+                    let response_text = cli.invoke_streaming(
+                        &agent.config,
+                        &prompt,
+                        &system_prompt,
+                        Some(session_id.as_str()),
+                        !is_new,
+                        {
+                            let state = &state;
+                            let request_id = request_id.clone();
+                            move |pid| {
+                                state
+                                    .active_chat_processes
+                                    .lock()
+                                    .map_err(|e| ClaudeCliError::Process(e.to_string()))?
+                                    .insert(request_id.clone(), pid);
+                                Ok(())
+                            }
+                        },
+                        {
+                            let state = &state;
+                            let request_id = request_id.clone();
+                            move || {
+                                state
+                                    .active_chat_processes
+                                    .lock()
+                                    .map_err(|e| ClaudeCliError::Process(e.to_string()))?
+                                    .remove(&request_id);
+                                Ok(())
+                            }
+                        },
+                        {
+                            let state = &state;
+                            let request_id = request_id.clone();
+                            move || is_request_cancelled(state, &request_id)
+                        },
+                        {
+                            let app = app.clone();
+                            let request_id = request_id.clone();
+                            let conversation_id = conversation_id.clone();
+                            let message_id = message_id.clone();
+                            let agent_id = agent.id.clone();
+                            let speaker = agent.name.clone();
+                            move |chunk| {
+                                app.emit(
+                                    "group-chat-stream",
+                                    GroupChatStreamEvent {
+                                        request_id: request_id.clone(),
+                                        conversation_id: conversation_id.clone(),
+                                        message_id: Some(message_id.clone()),
+                                        agent_id: Some(agent_id.clone()),
+                                        speaker: Some(speaker.clone()),
+                                        round: Some(round),
+                                        chunk: Some(chunk.to_string()),
+                                        message: None,
+                                        status: "chunk".to_string(),
+                                    },
+                                )
+                                .map_err(|e| ClaudeCliError::Process(e.to_string()))
+                            }
+                        },
+                    );
+
+                    // Handle response: retry with fresh session on empty output
+                    let response_text = match response_text {
+                        Ok(text) if !text.trim().is_empty() => text,
+                        Ok(empty_text) => {
+                            // Empty response — retry once with a new session
+                            if is_request_cancelled(&state, &request_id) {
+                                break 'rounds;
+                            }
+                            log::warn!(
+                                "[sequential] Agent {} returned empty output, retrying with fresh session",
+                                agent.name
+                            );
+                            let retry_session = Uuid::new_v4().to_string();
+                            let retry_result = cli.invoke_streaming(
+                                &agent.config,
+                                &prompt,
+                                &system_prompt,
+                                Some(retry_session.as_str()),
+                                false,
+                                {
+                                    let state = &state;
+                                    let request_id = request_id.clone();
+                                    move |pid| {
+                                        state
+                                            .active_chat_processes
+                                            .lock()
+                                            .map_err(|e| ClaudeCliError::Process(e.to_string()))?
+                                            .insert(request_id.clone(), pid);
+                                        Ok(())
+                                    }
+                                },
+                                {
+                                    let state = &state;
+                                    let request_id = request_id.clone();
+                                    move || {
+                                        state
+                                            .active_chat_processes
+                                            .lock()
+                                            .map_err(|e| ClaudeCliError::Process(e.to_string()))?
+                                            .remove(&request_id);
+                                        Ok(())
+                                    }
+                                },
+                                {
+                                    let state = &state;
+                                    let request_id = request_id.clone();
+                                    move || is_request_cancelled(state, &request_id)
+                                },
+                                {
+                                    let app = app.clone();
+                                    let request_id = request_id.clone();
+                                    let conversation_id = conversation_id.clone();
+                                    let agent_id = agent.id.clone();
+                                    let speaker = agent.name.clone();
+                                    move |chunk| {
+                                        let result = app.emit(
+                                            "group-chat-stream",
+                                            GroupChatStreamEvent {
+                                                request_id: request_id.clone(),
+                                                conversation_id: conversation_id.clone(),
+                                                message_id: None,
+                                                agent_id: Some(agent_id.clone()),
+                                                speaker: Some(speaker.clone()),
+                                                round: Some(round),
+                                                chunk: Some(chunk.to_string()),
+                                                message: None,
+                                                status: "chunk".to_string(),
+                                            },
+                                        );
+                                        if result.is_err() {
+                                            return Err(ClaudeCliError::Process("emitter error".to_string()));
+                                        }
+                                        Ok(())
+                                    }
+                                },
+                            );
+                            match retry_result {
+                                Ok(retry_text) if !retry_text.trim().is_empty() => {
+                                    if is_request_cancelled(&state, &request_id) {
+                                        break 'rounds;
+                                    }
+                                    // Retry succeeded — update session cache to use new session
+                                    {
+                                        let db = state.db.lock().map_err(|e| e.to_string())?;
+                                        let _ = persist_agent_session_id(&db, &agent.id, &retry_session);
+                                    }
+                                    session_cache.insert(agent.id.clone(), (retry_session, false, emitted.len()));
+                                    log::info!("[sequential] Retry succeeded for {} with fresh session", agent.name);
+                                    retry_text
+                                }
+                                _ => {
+                                    // Retry also failed — skip this agent turn
+                                    log::error!("[sequential] Retry also failed for agent {}", agent.name);
+                                    if is_request_cancelled(&state, &request_id) {
+                                        break 'rounds;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(ClaudeCliError::Cancelled) => break 'rounds,
+                        Err(error) => {
+                            // Non-empty error — retry once with fresh session
+                            log::warn!(
+                                "[sequential] Agent {} invoke_streaming error: {}. Retrying with fresh session.",
+                                agent.name, error
+                            );
+                            let retry_session = Uuid::new_v4().to_string();
+                            let retry_result = cli.invoke_streaming(
+                                &agent.config,
+                                &prompt,
+                                &system_prompt,
+                                Some(retry_session.as_str()),
+                                false,
+                                {
+                                    let state = &state;
+                                    let request_id = request_id.clone();
+                                    move |pid| {
+                                        state
+                                            .active_chat_processes
+                                            .lock()
+                                            .map_err(|e| ClaudeCliError::Process(e.to_string()))?
+                                            .insert(request_id.clone(), pid);
+                                        Ok(())
+                                    }
+                                },
+                                {
+                                    let state = &state;
+                                    let request_id = request_id.clone();
+                                    move || {
+                                        state
+                                            .active_chat_processes
+                                            .lock()
+                                            .map_err(|e| ClaudeCliError::Process(e.to_string()))?
+                                            .remove(&request_id);
+                                        Ok(())
+                                    }
+                                },
+                                {
+                                    let state = &state;
+                                    let request_id = request_id.clone();
+                                    move || is_request_cancelled(state, &request_id)
+                                },
+                                {
+                                    let app = app.clone();
+                                    let request_id = request_id.clone();
+                                    let conversation_id = conversation_id.clone();
+                                    let agent_id = agent.id.clone();
+                                    let speaker = agent.name.clone();
+                                    move |chunk| {
+                                        let result = app.emit(
+                                            "group-chat-stream",
+                                            GroupChatStreamEvent {
+                                                request_id: request_id.clone(),
+                                                conversation_id: conversation_id.clone(),
+                                                message_id: None,
+                                                agent_id: Some(agent_id.clone()),
+                                                speaker: Some(speaker.clone()),
+                                                round: Some(round),
+                                                chunk: Some(chunk.to_string()),
+                                                message: None,
+                                                status: "chunk".to_string(),
+                                            },
+                                        );
+                                        if result.is_err() {
+                                            return Err(ClaudeCliError::Process("emitter error".to_string()));
+                                        }
+                                        Ok(())
+                                    }
+                                },
+                            );
+                            match retry_result {
+                                Ok(retry_text) if !retry_text.trim().is_empty() => {
+                                    {
+                                        let db = state.db.lock().map_err(|e| e.to_string())?;
+                                        let _ = persist_agent_session_id(&db, &agent.id, &retry_session);
+                                    }
+                                    session_cache.insert(agent.id.clone(), (retry_session, false, emitted.len()));
+                                    log::info!("[sequential] Retry (after error) succeeded for {}", agent.name);
+                                    retry_text
+                                }
+                                Ok(_) => {
+                                    log::error!("[sequential] Retry returned empty for agent {}", agent.name);
+                                    continue;
+                                }
+                                Err(ClaudeCliError::Cancelled) => break 'rounds,
+                                Err(retry_error) => {
+                                    let error_text = format!("[错误] {} 调用失败(重试后): {}", agent.name, retry_error);
+                                    let msg = ACPMessage {
+                                        id: message_id.clone(),
+                                        performative: ACPPerformative::Inform,
+                                        sender: agent.address.clone(),
+                                        receiver: group_address.clone(),
+                                        content: ACPContent {
+                                            action: Some("group_chat_turn".to_string()),
+                                            parameters: None,
+                                            result: Some(serde_json::json!({"text": error_text})),
+                                            reason: None,
+                                        },
+                                        conversation_id: conversation_id.clone(),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                        metadata: Some(serde_json::json!({
+                                            "round": round,
+                                            "agentId": agent.id,
+                                            "speaker": agent.name
+                                        })),
+                                    };
+                                    emitted.push(msg.clone());
+                                    let _ = app.emit(
+                                        "group-chat-stream",
+                                        GroupChatStreamEvent {
+                                            request_id: request_id.clone(),
+                                            conversation_id: conversation_id.clone(),
+                                            message_id: Some(message_id),
+                                            agent_id: Some(agent.id.clone()),
+                                            speaker: Some(agent.name.clone()),
+                                            round: Some(round),
+                                            chunk: None,
+                                            message: Some(msg),
+                                            status: "message".to_string(),
+                                        },
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+
+                    let msg = ACPMessage {
+                        id: message_id.clone(),
+                        performative: ACPPerformative::Inform,
+                        sender: agent.address.clone(),
+                        receiver: group_address.clone(),
+                        content: ACPContent {
+                            action: Some("group_chat_turn".to_string()),
+                            parameters: None,
+                            result: Some(serde_json::json!({"text": response_text})),
+                            reason: None,
+                        },
+                        conversation_id: conversation_id.clone(),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        metadata: Some(serde_json::json!({
+                            "round": round,
+                            "agentId": agent.id,
+                            "speaker": agent.name
+                        })),
+                    };
+                    if is_request_cancelled(&state, &request_id) {
+                        break 'rounds;
+                    }
+                    emitted.push(msg.clone());
+                    let _ = app.emit(
+                        "group-chat-stream",
+                        GroupChatStreamEvent {
+                            request_id: request_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                            message_id: Some(message_id),
+                            agent_id: Some(agent.id.clone()),
+                            speaker: Some(agent.name.clone()),
+                            round: Some(round),
+                            chunk: None,
+                            message: Some(msg),
+                            status: "message".to_string(),
+                        },
+                    );
+
+                    {
+                        let db = state.db.lock().map_err(|e| e.to_string())?;
+                        let _ = persist_agent_session_id(&db, &agent.id, &session_id);
+                    }
+
+                    session_cache.insert(agent.id.clone(), (session_id, false, emitted.len()));
+                }
+            }
         }
     }
 
@@ -570,6 +1164,11 @@ pub async fn invoke_agent_group_chat_stream(
                 ],
             );
         }
+        // Update conversation timestamp
+        let _ = db.get_connection().execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![chrono::Utc::now().to_rfc3339(), conversation_id],
+        );
     }
 
     clear_cancelled_request(&state, &request_id);

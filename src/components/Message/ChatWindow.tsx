@@ -1,9 +1,10 @@
 import { useRef, useEffect, useMemo } from 'react';
-import { useAgentStore, useChatStore, useMessageStore, useUIStore } from '../../stores';
+import { useAgentStore, useChatStore, useConversationStore, useMessageStore, useUIStore } from '../../stores';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { ACPMessage } from '../../types';
 import type { ChatMessage } from '../../types/chat';
+import ConversationSidebar from './ConversationSidebar';
 
 interface GroupChatResult {
   conversationId: string;
@@ -59,7 +60,7 @@ function toChatMessage(message: ACPMessage): ChatMessage {
 
 export default function ChatWindow() {
   const { agents, fetchAgents, startAgentSession } = useAgentStore();
-  const { messages, fetchMessages } = useMessageStore();
+  const { fetchMessages } = useMessageStore();
   const {
     chatMessages,
     selectedAgentIds,
@@ -69,6 +70,8 @@ export default function ChatWindow() {
     isSending,
     isStopping,
     autoContinue,
+    autoContinueDelay,
+    chatMode,
     resetTransientState,
     setChatMessages,
     appendChatMessages,
@@ -80,8 +83,13 @@ export default function ChatWindow() {
     setIsSending,
     setIsStopping,
     setAutoContinue,
+    setAutoContinueDelay,
+    setChatMode,
+    switchConversation,
+    removeConversationFromCache,
   } = useChatStore();
-  const { agentDrawerCollapsed, toggleAgentDrawer } = useUIStore();
+  const { conversations: convList, createConversation, deleteConversation, updateConversation } = useConversationStore();
+  const { agentDrawerCollapsed, toggleAgentDrawer, conversationSidebarCollapsed, toggleConversationSidebar } = useUIStore();
   const chatEndRef = useRef<HTMLDivElement>(null);
   const stopRequestedRef = useRef(false);
   const activeRequestIdRef = useRef<string | null>(null);
@@ -93,28 +101,30 @@ export default function ChatWindow() {
   const selectedAgents = ccAgents.filter((agent) => selectedAgentIds.includes(agent.id));
   const canSend = selectedAgents.length > 0 && inputText.trim().length > 0 && !isSending;
 
+  // Load agents and conversations on mount
   useEffect(() => {
     fetchAgents();
     fetchMessages();
-  }, [fetchAgents, fetchMessages]);
+    if (convList.length === 0) {
+      useConversationStore.getState().fetchConversations();
+    }
+  }, [fetchAgents, fetchMessages, convList.length]);
 
+  // Auto-select agents if none selected
   useEffect(() => {
     if (selectedAgentIds.length === 0 && ccAgents.length > 0) {
       setSelectedAgentIds(ccAgents.slice(0, 3).map((agent) => agent.id));
     }
   }, [ccAgents, selectedAgentIds.length]);
 
+  // Auto-load most recent conversation on first load
   useEffect(() => {
-    if (conversationId) {
-      const history = messages
-        .filter((message) => message.conversationId === conversationId)
-        .map(toChatMessage);
-      if (history.length > 0) {
-        setChatMessages(history);
-      }
+    if (!conversationId && convList.length > 0) {
+      handleSwitchConversation(convList[0].id);
     }
-  }, [conversationId, messages, setChatMessages]);
+  }, [convList.length > 0 && !conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Auto-scroll on new messages
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
@@ -126,6 +136,58 @@ export default function ChatWindow() {
   const handleResetChat = () => {
     resetTransientState();
     setChatMessages([]);
+  };
+
+  // Switch to an existing conversation
+  const handleSwitchConversation = async (targetId: string) => {
+    switchConversation(targetId);
+    await fetchMessages({ conversationId: targetId });
+    const filtered = useMessageStore.getState().messages.filter(
+      (m) => m.conversationId === targetId
+    );
+    setChatMessages(filtered.map(toChatMessage));
+    // Restore agent selection from conversation metadata
+    const conv = useConversationStore.getState().conversations.find((c) => c.id === targetId);
+    if (conv?.selectedAgentIds.length) {
+      setSelectedAgentIds(conv.selectedAgentIds);
+    }
+  };
+
+  // Create a new conversation
+  const handleNewConversation = async (title: string) => {
+    switchConversation(null); // clean slate
+    try {
+      const conv = await createConversation({ title, selectedAgentIds });
+      setConversationId(conv.id);
+      setChatMessages([]);
+    } catch (err) {
+      console.error('创建会话失败:', err);
+    }
+  };
+
+  // Delete a conversation
+  const handleDeleteConversation = async (id: string) => {
+    try {
+      await deleteConversation(id);
+      removeConversationFromCache(id);
+      if (conversationId === id) {
+        switchConversation(null);
+        setChatMessages([]);
+      }
+      await useConversationStore.getState().fetchConversations();
+    } catch (err) {
+      console.error('删除会话失败:', err);
+    }
+  };
+
+  // Rename a conversation
+  const handleRenameConversation = async (id: string, newTitle: string) => {
+    try {
+      await updateConversation({ id, title: newTitle });
+      await useConversationStore.getState().fetchConversations();
+    } catch (err) {
+      console.error('重命名会话失败:', err);
+    }
   };
 
   const handleSend = async () => {
@@ -235,6 +297,14 @@ export default function ChatWindow() {
               setChatMessages([...current, chatMessage]);
             }
           }
+
+          if (payload.status === 'done') {
+            setChatMessages(
+              useChatStore.getState().chatMessages.map((message) =>
+                message.isLoading ? { ...message, isLoading: false } : message
+              )
+            );
+          }
         });
 
         let result: GroupChatResult | null = null;
@@ -252,6 +322,7 @@ export default function ChatWindow() {
               rounds,
               conversationId: activeConversationId,
               requestId,
+              chatMode,
             },
           });
         } finally {
@@ -281,31 +352,40 @@ export default function ChatWindow() {
 
         activeConversationId = result.conversationId;
         setConversationId(result.conversationId);
-        setChatMessages([
-          ...useChatStore.getState().chatMessages.filter((message) => message.id !== loadingId),
-          ...result.messages.map(toChatMessage),
-        ]);
+
+        // Finalize loading messages and remove placeholder, keep streaming messages
+        setChatMessages(
+          useChatStore.getState().chatMessages
+            .filter((message) => message.id !== loadingId)
+            .map((message) => ({ ...message, isLoading: false }))
+        );
         await fetchMessages();
         await fetchAgents();
+        // Update conversation metadata and refresh list
+        try {
+          await updateConversation({
+            id: result.conversationId,
+            selectedAgentIds,
+          });
+          await useConversationStore.getState().fetchConversations();
+        } catch (_) { /* ignore */ }
 
         if (!autoContinue) {
           break;
         }
 
         nextPrompt = '继续这段多智能体对话，基于上一轮内容自然推进，不要结束。';
-        await new Promise((resolve) => setTimeout(resolve, 600));
+        await new Promise((resolve) => setTimeout(resolve, autoContinueDelay));
       }
     } catch (error) {
       setChatMessages(
-        useChatStore.getState().chatMessages.map((message) =>
-          message.id === loadingId
-            ? {
-                ...message,
-                text: `[错误] ${String(error)}`,
-                isLoading: false,
-              }
-            : message
-        )
+        useChatStore.getState().chatMessages
+          .filter((message) => message.id !== loadingId)
+          .map((message) =>
+            message.isLoading
+              ? { ...message, isLoading: false }
+              : message
+          )
       );
     } finally {
       setIsSending(false);
@@ -334,10 +414,27 @@ export default function ChatWindow() {
     }
   };
 
+  const activeConvTitle = conversationId
+    ? convList.find((c) => c.id === conversationId)?.title ?? '未命名会话'
+    : '新对话';
+
   return (
-    <div className="flex h-full gap-4">
+    <div className="flex h-full">
+      {/* Conversation Sidebar */}
+      <ConversationSidebar
+        conversations={convList}
+        activeConversationId={conversationId}
+        onSelect={handleSwitchConversation}
+        onNew={handleNewConversation}
+        onDelete={handleDeleteConversation}
+        onRename={handleRenameConversation}
+        collapsed={conversationSidebarCollapsed}
+        onToggleCollapse={toggleConversationSidebar}
+      />
+
+      {/* Agent Drawer */}
       <div
-        className={`flex-shrink-0 bg-gray-800 rounded-lg border border-gray-700 flex flex-col transition-all ${
+        className={`flex-shrink-0 bg-gray-800 border-r border-l border-gray-700 flex flex-col transition-all ${
           agentDrawerCollapsed ? 'w-14' : 'w-72'
         }`}
       >
@@ -398,41 +495,74 @@ export default function ChatWindow() {
         </div>
       </div>
 
-      <div className="flex-1 bg-gray-800 rounded-lg border border-gray-700 flex flex-col min-w-0">
-        <div className="p-3 border-b border-gray-700 flex items-center justify-between gap-3">
+      {/* Chat Panel */}
+      <div className="flex-1 bg-gray-800 flex flex-col min-w-0">
+        {/* Simplified Header */}
+        <div className="px-4 py-2.5 border-b border-gray-700 flex items-center justify-between gap-3">
           <div className="min-w-0">
-            <div className="font-semibold">多智能体对话</div>
-            <div className="text-xs text-gray-500 truncate">
-              {conversationId ? `会话 ${conversationId}` : '你作为引导者启动对话，智能体按选择顺序发言'}
+            <div className="font-semibold text-sm">{activeConvTitle}</div>
+            <div className="text-xs text-gray-500">
+              {conversationId
+                ? `${selectedAgents.length} 个智能体参与`
+                : '选择智能体并开始对话，会话将自动创建'}
             </div>
           </div>
-          <div className="flex items-center gap-2 text-sm">
+          <div className="flex items-center gap-3 text-sm">
             <button
               onClick={handleResetChat}
-              className="h-8 px-3 rounded-md bg-gray-700 hover:bg-gray-600 text-gray-200 text-xs"
+              className="h-7 px-3 rounded-md bg-gray-700 hover:bg-gray-600 text-gray-200 text-xs"
             >
-              清空当前
+              清空
             </button>
-            <span className="text-gray-400">回合</span>
-            <input
-              type="number"
-              min={1}
-              max={6}
-              value={rounds}
-              onChange={(e) => setRounds(Math.min(6, Math.max(1, Number(e.target.value) || 1)))}
-              className="w-16 bg-gray-900 border border-gray-700 rounded-lg px-2 py-1 text-gray-100 focus:border-primary-500 focus:outline-none"
-            />
-            <label className="flex items-center gap-2 ml-2 text-xs text-gray-300">
+            <div className="flex items-center gap-1.5 text-xs text-gray-400">
+              <span>回合</span>
+              <input
+                type="number"
+                min={1}
+                max={6}
+                value={rounds}
+                onChange={(e) => setRounds(Math.min(6, Math.max(1, Number(e.target.value) || 1)))}
+                className="w-14 bg-gray-900 border border-gray-700 rounded px-1.5 py-0.5 text-gray-100 text-center focus:border-primary-500 focus:outline-none"
+              />
+            </div>
+            <label className="flex items-center gap-1.5 text-xs text-gray-300 cursor-pointer">
               <input
                 type="checkbox"
                 checked={autoContinue}
                 onChange={(e) => setAutoContinue(e.target.checked)}
+                className="rounded border-gray-600"
               />
               自动续聊
             </label>
+            <div className="flex items-center gap-1 text-xs text-gray-400">
+              <span>延时</span>
+              <input
+                type="range"
+                min={0}
+                max={5000}
+                step={100}
+                value={autoContinueDelay}
+                onChange={(e) => setAutoContinueDelay(Number(e.target.value))}
+                className="w-20 accent-primary-500"
+              />
+              <span className="w-8 text-right">{autoContinueDelay}ms</span>
+            </div>
+            <div className="flex items-center gap-1 text-xs text-gray-400">
+              <span>模式</span>
+              <select
+                value={chatMode}
+                onChange={(e) => setChatMode(e.target.value as 'sequential' | 'parallel' | 'debate')}
+                className="bg-gray-900 border border-gray-700 rounded px-1.5 py-0.5 text-gray-100 focus:border-primary-500 focus:outline-none"
+              >
+                <option value="sequential">顺序</option>
+                <option value="parallel">并行</option>
+                <option value="debate">辩论</option>
+              </select>
+            </div>
           </div>
         </div>
 
+        {/* Messages */}
         <div className="flex-1 overflow-auto p-4 space-y-4">
           {chatMessages.length === 0 && (
             <div className="flex items-center justify-center h-full text-gray-500">
@@ -479,6 +609,7 @@ export default function ChatWindow() {
           <div ref={chatEndRef} />
         </div>
 
+        {/* Input */}
         <div className="p-3 border-t border-gray-700">
           <div className="flex gap-2">
             <textarea

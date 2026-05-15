@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useAgentStore, useMessageStore, useUIStore } from './stores';
+import { useAgentStore, useConversationStore, useUIStore } from './stores';
 import Layout from './components/Layout/Layout';
 import Dashboard from './components/Dashboard/Dashboard';
 import AgentList from './components/Agent/AgentList';
@@ -10,13 +10,13 @@ import ChatWindow from './components/Message/ChatWindow';
 
 function App() {
   const { fetchAgents } = useAgentStore();
-  const { fetchConversations } = useMessageStore();
+  const { fetchConversations: fetchConvList } = useConversationStore();
   const { currentView } = useUIStore();
 
   useEffect(() => {
     fetchAgents();
-    fetchConversations();
-  }, [fetchAgents, fetchConversations]);
+    fetchConvList();
+  }, [fetchAgents, fetchConvList]);
 
   const renderView = () => {
     switch (currentView) {

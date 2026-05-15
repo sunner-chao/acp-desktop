@@ -11,12 +11,14 @@ interface UIState {
   agentDrawerCollapsed: boolean;
   protocolDrawerCollapsed: boolean;
   historyDrawerCollapsed: boolean;
+  conversationSidebarCollapsed: boolean;
 
   setCurrentView: (view: ViewMode) => void;
   toggleSidebar: () => void;
   toggleAgentDrawer: () => void;
   toggleProtocolDrawer: () => void;
   toggleHistoryDrawer: () => void;
+  toggleConversationSidebar: () => void;
   openModal: (id: string, data?: unknown) => void;
   closeModal: () => void;
 }
@@ -31,6 +33,7 @@ export const useUIStore = create<UIState>()(
       agentDrawerCollapsed: false,
       protocolDrawerCollapsed: false,
       historyDrawerCollapsed: false,
+      conversationSidebarCollapsed: false,
 
       setCurrentView: (view) => set({ currentView: view }),
       toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
@@ -40,6 +43,8 @@ export const useUIStore = create<UIState>()(
         set((state) => ({ protocolDrawerCollapsed: !state.protocolDrawerCollapsed })),
       toggleHistoryDrawer: () =>
         set((state) => ({ historyDrawerCollapsed: !state.historyDrawerCollapsed })),
+      toggleConversationSidebar: () =>
+        set((state) => ({ conversationSidebarCollapsed: !state.conversationSidebarCollapsed })),
       openModal: (id, data) => set({ modalOpen: id, modalData: data ?? null }),
       closeModal: () => set({ modalOpen: null, modalData: null }),
     }),
@@ -52,6 +57,7 @@ export const useUIStore = create<UIState>()(
         agentDrawerCollapsed: state.agentDrawerCollapsed,
         protocolDrawerCollapsed: state.protocolDrawerCollapsed,
         historyDrawerCollapsed: state.historyDrawerCollapsed,
+        conversationSidebarCollapsed: state.conversationSidebarCollapsed,
       }),
     }
   )

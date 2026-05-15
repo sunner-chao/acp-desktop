@@ -23,6 +23,7 @@ export interface SendMessageInput {
   receiver: string;
   performative: ACPPerformative;
   content: ACPContent;
+  conversationId?: string;
 }
 
 export interface MessageFilter {

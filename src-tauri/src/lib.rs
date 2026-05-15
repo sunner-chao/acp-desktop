@@ -2,7 +2,7 @@ mod commands;
 mod models;
 mod services;
 
-use commands::{agents, claude, messages};
+use commands::{agents, claude, conversations, messages, system};
 use services::db::Database;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -33,8 +33,16 @@ pub fn run() {
                 .expect("Failed to get app data dir");
             std::fs::create_dir_all(&app_dir).expect("Failed to create app data dir");
 
+            // 多实例支持：通过 ACP_INSTANCE 环境变量区分数据库
+            let instance = std::env::var("ACP_INSTANCE").unwrap_or_default();
+            let suffix = if instance.is_empty() {
+                String::new()
+            } else {
+                format!("_{}", instance)
+            };
+
             // 初始化 file-based logging
-            let log_path = app_dir.join("acp_desktop.log");
+            let log_path = app_dir.join(format!("acp_desktop{}.log", suffix));
             let log_file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -46,7 +54,7 @@ pub fn run() {
                 .init();
             log::info!("Starting ACP Desktop Agent Hub, log at {:?}", log_path);
 
-            let db_path = app_dir.join("acp_desktop.db");
+            let db_path = app_dir.join(format!("acp_desktop{}.db", suffix));
             let db = Database::new(&db_path).expect("Failed to initialize database");
 
             app.manage(AppState {
@@ -79,6 +87,11 @@ pub fn run() {
             claude::stop_agent_group_chat,
             claude::get_claude_settings,
             claude::check_claude_cli,
+            conversations::create_conversation,
+            conversations::list_conversations,
+            conversations::delete_conversation,
+            conversations::update_conversation,
+            system::reset_database,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

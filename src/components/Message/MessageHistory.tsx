@@ -1,25 +1,22 @@
 import { useEffect, useState } from 'react';
-import { useMessageStore, useUIStore } from '../../stores';
+import { useMessageStore, useConversationStore, useUIStore } from '../../stores';
 import type { ACPPerformative } from '../../types';
 
 export default function MessageHistory() {
   const {
     messages,
-    conversations,
     fetchMessages,
-    fetchConversations,
-    selectConversation,
-    selectedConversationId,
     clearMessages,
     clearConversationMessages,
   } = useMessageStore();
+  const { conversations: convList, fetchConversations, selectedConversationId, selectConversation } = useConversationStore();
   const { historyDrawerCollapsed, toggleHistoryDrawer } = useUIStore();
   const [filter, setFilter] = useState<{ sender?: string; receiver?: string; performative?: ACPPerformative }>({});
 
   useEffect(() => {
     fetchMessages();
-    fetchConversations();
-  }, [fetchMessages, fetchConversations]);
+    if (convList.length === 0) fetchConversations();
+  }, [fetchMessages, convList.length]);
 
   const filteredMessages = messages.filter((msg) => {
     if (selectedConversationId && msg.conversationId !== selectedConversationId) return false;
@@ -51,7 +48,7 @@ export default function MessageHistory() {
             onClick={async () => {
               if (confirm('确定要清空全部历史消息吗？')) {
                 await clearMessages();
-                await fetchConversations();
+                await useConversationStore.getState().fetchConversations();
               }
             }}
             className="px-3 py-2 text-sm rounded bg-red-700 hover:bg-red-600 text-white"
@@ -111,15 +108,15 @@ export default function MessageHistory() {
             >
               {historyDrawerCollapsed ? 'A' : '所有会话'}
             </div>
-            {conversations.map((convId) => (
+            {convList.map((conv) => (
               <div
-                key={convId}
-                onClick={() => selectConversation(convId)}
-                className={`p-2 rounded cursor-pointer text-xs font-mono ${
-                  selectedConversationId === convId ? 'bg-primary-900/50 text-primary-300' : 'hover:bg-gray-700'
+                key={conv.id}
+                onClick={() => selectConversation(conv.id)}
+                className={`p-2 rounded cursor-pointer text-xs truncate ${
+                  selectedConversationId === conv.id ? 'bg-primary-900/50 text-primary-300' : 'hover:bg-gray-700'
                 }`}
               >
-                {historyDrawerCollapsed ? convId.slice(0, 2) : `${convId.slice(0, 8)}...`}
+                {historyDrawerCollapsed ? conv.id.slice(0, 2) : `${conv.title.slice(0, 12)}`}
               </div>
             ))}
           </div>
