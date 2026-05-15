@@ -503,9 +503,49 @@ pub async fn invoke_agent_group_chat_stream(
                     );
 
                     let response_text = match response_result {
-                        Ok(text) => text,
+                        Ok(text) if !text.trim().is_empty() => text,
+                        Ok(_) => {
+                            // Empty output in parallel mode — retry with compacted prompt
+                            log::warn!("[parallel] Agent {} returned empty, retrying with compacted prompt", agent.name);
+                            let retry_session = Uuid::new_v4().to_string();
+                            let retry_prompt = build_compact_prompt(&agent.name, &emitted[last_seen..], &prompt);
+                            match cli.invoke(&agent.config, &retry_prompt, &system_prompt, Some(retry_session.as_str()), false) {
+                                Ok(retry_text) if !retry_text.trim().is_empty() => {
+                                    session_cache.insert(agent.id.clone(), (retry_session, false, emitted.len()));
+                                    retry_text
+                                }
+                                _ => format!("[警告] {} 返回空结果", agent.name),
+                            }
+                        }
                         Err(ClaudeCliError::Cancelled) => break 'rounds,
-                        Err(error) => format!("[错误] {} 调用失败: {}", agent.name, error),
+                        Err(ClaudeCliError::ContextOverflow(original_text)) => {
+                            log::warn!("[parallel] Agent {} context overflow: {}. Retrying with compacted prompt.", agent.name, &original_text[..original_text.len().min(100)]);
+                            let retry_session = Uuid::new_v4().to_string();
+                            let retry_prompt = build_compact_prompt(&agent.name, &emitted[last_seen..], &prompt);
+                            match cli.invoke(&agent.config, &retry_prompt, &system_prompt, Some(retry_session.as_str()), false) {
+                                Ok(retry_text) if !retry_text.trim().is_empty() => {
+                                    session_cache.insert(agent.id.clone(), (retry_session, false, emitted.len()));
+                                    retry_text
+                                }
+                                _ => format!("[错误] {} 上下文溢出(压缩后重试失败)", agent.name),
+                            }
+                        }
+                        Err(error) => {
+                            if is_prompt_too_long_error(&error) {
+                                log::warn!("[parallel] Agent {} hit context limit, retrying with compacted prompt", agent.name);
+                                let retry_session = Uuid::new_v4().to_string();
+                                let retry_prompt = build_compact_prompt(&agent.name, &emitted[last_seen..], &prompt);
+                                match cli.invoke(&agent.config, &retry_prompt, &system_prompt, Some(retry_session.as_str()), false) {
+                                    Ok(retry_text) if !retry_text.trim().is_empty() => {
+                                        session_cache.insert(agent.id.clone(), (retry_session, false, emitted.len()));
+                                        retry_text
+                                    }
+                                    _ => format!("[错误] {} 调用失败(上下文压缩后重试): {}", agent.name, error),
+                                }
+                            } else {
+                                format!("[错误] {} 调用失败: {}", agent.name, error)
+                            }
+                        }
                     };
 
                     round_results.push((idx, session_id, message_id, is_new, response_text));
@@ -669,8 +709,143 @@ pub async fn invoke_agent_group_chat_stream(
                     );
 
                     let response_text = match response_text {
-                        Ok(text) => text,
+                        Ok(text) if !text.trim().is_empty() => text,
+                        Ok(_) => {
+                            // Empty in debate mode — retry with compacted prompt
+                            if is_request_cancelled(&state, &request_id) { break 'rounds; }
+                            log::warn!("[debate] Agent {} returned empty, retrying with compacted prompt", agent.name);
+                            let retry_session = Uuid::new_v4().to_string();
+                            let retry_prompt = build_compact_prompt(&agent.name, &emitted[last_seen..], &debate_prompt);
+                            match cli.invoke(&agent.config, &retry_prompt, &system_prompt, Some(retry_session.as_str()), false) {
+                                Ok(retry_text) if !retry_text.trim().is_empty() => {
+                                    {
+                                        let db = state.db.lock().map_err(|e| e.to_string())?;
+                                        let _ = persist_agent_session_id(&db, &agent.id, &retry_session);
+                                    }
+                                    session_cache.insert(agent.id.clone(), (retry_session, false, emitted.len()));
+                                    retry_text
+                                }
+                                _ => {
+                                    if is_request_cancelled(&state, &request_id) { break 'rounds; }
+                                    continue;
+                                }
+                            }
+                        }
                         Err(ClaudeCliError::Cancelled) => break 'rounds,
+                        Err(ClaudeCliError::ContextOverflow(original_text)) => {
+                            // Context overflow in debate — retry with compacted prompt + fresh session
+                            log::warn!(
+                                "[debate] Agent {} context overflow: {}. Retrying with compacted prompt.",
+                                agent.name,
+                                &original_text[..original_text.len().min(100)]
+                            );
+                            let retry_session = Uuid::new_v4().to_string();
+                            let retry_prompt = build_compact_prompt(&agent.name, &emitted[last_seen..], &debate_prompt);
+                            match cli.invoke(&agent.config, &retry_prompt, &system_prompt, Some(retry_session.as_str()), false) {
+                                Ok(retry_text) if !retry_text.trim().is_empty() => {
+                                    {
+                                        let db = state.db.lock().map_err(|e| e.to_string())?;
+                                        let _ = persist_agent_session_id(&db, &agent.id, &retry_session);
+                                    }
+                                    session_cache.insert(agent.id.clone(), (retry_session, false, emitted.len()));
+                                    retry_text
+                                }
+                                _ => {
+                                    let error_text = format!("[错误] {} 上下文溢出(压缩后重试失败)", agent.name);
+                                    let msg = ACPMessage {
+                                        id: message_id.clone(),
+                                        performative: ACPPerformative::Inform,
+                                        sender: agent.address.clone(),
+                                        receiver: group_address.clone(),
+                                        content: ACPContent {
+                                            action: Some("group_chat_turn".to_string()),
+                                            parameters: None,
+                                            result: Some(serde_json::json!({"text": error_text})),
+                                            reason: None,
+                                        },
+                                        conversation_id: conversation_id.clone(),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                        metadata: Some(serde_json::json!({
+                                            "round": round,
+                                            "agentId": agent.id,
+                                            "speaker": agent.name,
+                                            "mode": "debate"
+                                        })),
+                                    };
+                                    emitted.push(msg.clone());
+                                    let _ = app.emit(
+                                        "group-chat-stream",
+                                        GroupChatStreamEvent {
+                                            request_id: request_id.clone(),
+                                            conversation_id: conversation_id.clone(),
+                                            message_id: Some(message_id),
+                                            agent_id: Some(agent.id.clone()),
+                                            speaker: Some(agent.name.clone()),
+                                            round: Some(round),
+                                            chunk: None,
+                                            message: Some(msg),
+                                            status: "message".to_string(),
+                                        },
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(error) if is_prompt_too_long_error(&error) => {
+                            // Context overflow via Process error in debate — retry with compacted prompt + fresh session
+                            log::warn!("[debate] Agent {} hit context limit, retrying with compacted prompt", agent.name);
+                            let retry_session = Uuid::new_v4().to_string();
+                            let retry_prompt = build_compact_prompt(&agent.name, &emitted[last_seen..], &debate_prompt);
+                            match cli.invoke(&agent.config, &retry_prompt, &system_prompt, Some(retry_session.as_str()), false) {
+                                Ok(retry_text) if !retry_text.trim().is_empty() => {
+                                    {
+                                        let db = state.db.lock().map_err(|e| e.to_string())?;
+                                        let _ = persist_agent_session_id(&db, &agent.id, &retry_session);
+                                    }
+                                    session_cache.insert(agent.id.clone(), (retry_session, false, emitted.len()));
+                                    retry_text
+                                }
+                                _ => {
+                                    let error_text = format!("[错误] {} 调用失败(上下文压缩后): {}", agent.name, error);
+                                    let msg = ACPMessage {
+                                        id: message_id.clone(),
+                                        performative: ACPPerformative::Inform,
+                                        sender: agent.address.clone(),
+                                        receiver: group_address.clone(),
+                                        content: ACPContent {
+                                            action: Some("group_chat_turn".to_string()),
+                                            parameters: None,
+                                            result: Some(serde_json::json!({"text": error_text})),
+                                            reason: None,
+                                        },
+                                        conversation_id: conversation_id.clone(),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                        metadata: Some(serde_json::json!({
+                                            "round": round,
+                                            "agentId": agent.id,
+                                            "speaker": agent.name,
+                                            "mode": "debate"
+                                        })),
+                                    };
+                                    emitted.push(msg.clone());
+                                    let _ = app.emit(
+                                        "group-chat-stream",
+                                        GroupChatStreamEvent {
+                                            request_id: request_id.clone(),
+                                            conversation_id: conversation_id.clone(),
+                                            message_id: Some(message_id),
+                                            agent_id: Some(agent.id.clone()),
+                                            speaker: Some(agent.name.clone()),
+                                            round: Some(round),
+                                            chunk: None,
+                                            message: Some(msg),
+                                            status: "message".to_string(),
+                                        },
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         Err(error) => {
                             let error_text = format!("[错误] {} 调用失败: {}", agent.name, error);
                             let msg = ACPMessage {
@@ -872,18 +1047,19 @@ pub async fn invoke_agent_group_chat_stream(
                     let response_text = match response_text {
                         Ok(text) if !text.trim().is_empty() => text,
                         Ok(empty_text) => {
-                            // Empty response — retry once with a new session
+                            // Empty response — likely context overflow, retry with compacted prompt + new session
                             if is_request_cancelled(&state, &request_id) {
                                 break 'rounds;
                             }
                             log::warn!(
-                                "[sequential] Agent {} returned empty output, retrying with fresh session",
+                                "[sequential] Agent {} returned empty output, retrying with compacted prompt + fresh session",
                                 agent.name
                             );
                             let retry_session = Uuid::new_v4().to_string();
+                            let retry_prompt = build_compact_prompt(&agent.name, &emitted[last_seen..], &prompt);
                             let retry_result = cli.invoke_streaming(
                                 &agent.config,
-                                &prompt,
+                                &retry_prompt,
                                 &system_prompt,
                                 Some(retry_session.as_str()),
                                 false,
@@ -969,8 +1145,135 @@ pub async fn invoke_agent_group_chat_stream(
                             }
                         }
                         Err(ClaudeCliError::Cancelled) => break 'rounds,
+                        Err(ClaudeCliError::ContextOverflow(original_text)) => {
+                            // Context overflow detected in CLI response — retry with compacted prompt + fresh session
+                            log::warn!(
+                                "[sequential] Agent {} context overflow: {}. Retrying with compacted prompt + fresh session.",
+                                agent.name,
+                                &original_text[..original_text.len().min(100)]
+                            );
+                            let retry_session = Uuid::new_v4().to_string();
+                            let retry_prompt = build_compact_prompt(&agent.name, &emitted[last_seen..], &prompt);
+                            let retry_result = cli.invoke_streaming(
+                                &agent.config,
+                                &retry_prompt,
+                                &system_prompt,
+                                Some(retry_session.as_str()),
+                                false,
+                                {
+                                    let state = &state;
+                                    let request_id = request_id.clone();
+                                    move |pid| {
+                                        state
+                                            .active_chat_processes
+                                            .lock()
+                                            .map_err(|e| ClaudeCliError::Process(e.to_string()))?
+                                            .insert(request_id.clone(), pid);
+                                        Ok(())
+                                    }
+                                },
+                                {
+                                    let state = &state;
+                                    let request_id = request_id.clone();
+                                    move || {
+                                        state
+                                            .active_chat_processes
+                                            .lock()
+                                            .map_err(|e| ClaudeCliError::Process(e.to_string()))?
+                                            .remove(&request_id);
+                                        Ok(())
+                                    }
+                                },
+                                {
+                                    let state = &state;
+                                    let request_id = request_id.clone();
+                                    move || is_request_cancelled(state, &request_id)
+                                },
+                                {
+                                    let app = app.clone();
+                                    let request_id = request_id.clone();
+                                    let conversation_id = conversation_id.clone();
+                                    let agent_id = agent.id.clone();
+                                    let speaker = agent.name.clone();
+                                    move |chunk| {
+                                        let result = app.emit(
+                                            "group-chat-stream",
+                                            GroupChatStreamEvent {
+                                                request_id: request_id.clone(),
+                                                conversation_id: conversation_id.clone(),
+                                                message_id: None,
+                                                agent_id: Some(agent_id.clone()),
+                                                speaker: Some(speaker.clone()),
+                                                round: Some(round),
+                                                chunk: Some(chunk.to_string()),
+                                                message: None,
+                                                status: "chunk".to_string(),
+                                            },
+                                        );
+                                        if result.is_err() {
+                                            return Err(ClaudeCliError::Process("emitter error".to_string()));
+                                        }
+                                        Ok(())
+                                    }
+                                },
+                            );
+                            match retry_result {
+                                Ok(retry_text) if !retry_text.trim().is_empty() => {
+                                    {
+                                        let db = state.db.lock().map_err(|e| e.to_string())?;
+                                        let _ = persist_agent_session_id(&db, &agent.id, &retry_session);
+                                    }
+                                    session_cache.insert(agent.id.clone(), (retry_session, false, emitted.len()));
+                                    log::info!("[sequential] Retry (after error) succeeded for {}", agent.name);
+                                    retry_text
+                                }
+                                Ok(_) => {
+                                    log::error!("[sequential] Retry returned empty for agent {}", agent.name);
+                                    continue;
+                                }
+                                Err(ClaudeCliError::Cancelled) => break 'rounds,
+                                Err(retry_error) => {
+                                    let error_text = format!("[错误] {} 调用失败(重试后): {}", agent.name, retry_error);
+                                    let msg = ACPMessage {
+                                        id: message_id.clone(),
+                                        performative: ACPPerformative::Inform,
+                                        sender: agent.address.clone(),
+                                        receiver: group_address.clone(),
+                                        content: ACPContent {
+                                            action: Some("group_chat_turn".to_string()),
+                                            parameters: None,
+                                            result: Some(serde_json::json!({"text": error_text})),
+                                            reason: None,
+                                        },
+                                        conversation_id: conversation_id.clone(),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                        metadata: Some(serde_json::json!({
+                                            "round": round,
+                                            "agentId": agent.id,
+                                            "speaker": agent.name
+                                        })),
+                                    };
+                                    emitted.push(msg.clone());
+                                    let _ = app.emit(
+                                        "group-chat-stream",
+                                        GroupChatStreamEvent {
+                                            request_id: request_id.clone(),
+                                            conversation_id: conversation_id.clone(),
+                                            message_id: Some(message_id),
+                                            agent_id: Some(agent.id.clone()),
+                                            speaker: Some(agent.name.clone()),
+                                            round: Some(round),
+                                            chunk: None,
+                                            message: Some(msg),
+                                            status: "message".to_string(),
+                                        },
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         Err(error) => {
-                            // Non-empty error — retry once with fresh session
+                            // Generic error — retry once with fresh session
                             log::warn!(
                                 "[sequential] Agent {} invoke_streaming error: {}. Retrying with fresh session.",
                                 agent.name, error
@@ -1046,7 +1349,7 @@ pub async fn invoke_agent_group_chat_stream(
                                         let _ = persist_agent_session_id(&db, &agent.id, &retry_session);
                                     }
                                     session_cache.insert(agent.id.clone(), (retry_session, false, emitted.len()));
-                                    log::info!("[sequential] Retry (after error) succeeded for {}", agent.name);
+                                    log::info!("[sequential] Retry succeeded for {}", agent.name);
                                     retry_text
                                 }
                                 Ok(_) => {
@@ -1249,6 +1552,68 @@ fn extract_message_text(message: &ACPMessage) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .map(|v| v.to_string())
         })
+}
+
+/// Detect "Prompt is too long" or context overflow errors from Claude CLI
+fn is_prompt_too_long_error(error: &ClaudeCliError) -> bool {
+    let msg = match error {
+        ClaudeCliError::Process(s) => s.to_lowercase(),
+        _ => return false,
+    };
+    msg.contains("prompt is too long")
+        || msg.contains("prompt_too_long")
+        || msg.contains("context length")
+        || msg.contains("context window")
+        || msg.contains("token limit")
+        || msg.contains("max_tokens")
+        || msg.contains("too many tokens")
+        || msg.contains("request too large")
+}
+
+/// Build a compacted prompt that summarizes the conversation history
+/// so the agent retains context without the full transcript blowing the token limit
+fn build_compact_prompt(
+    agent_name: &str,
+    messages: &[ACPMessage],
+    original_prompt: &str,
+) -> String {
+    // Extract just the latest topic/question from the original prompt
+    let latest_topic = if let Some(topic_start) = original_prompt.find("New ACP messages") {
+        &original_prompt[topic_start..]
+    } else if let Some(topic_start) = original_prompt.find("Current conversation") {
+        &original_prompt[topic_start..]
+    } else {
+        original_prompt
+    };
+
+    // Build a concise summary of the conversation history
+    let summary = messages
+        .iter()
+        .filter_map(|msg| {
+            let speaker = msg
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("speaker"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| msg.sender.as_str());
+            let text = extract_message_text(msg)?;
+            // Truncate each message to ~200 chars to keep summary compact
+            let truncated = if text.len() > 200 {
+                format!("{}...", &text[..200])
+            } else {
+                text
+            };
+            Some(format!("{}: {}", speaker, truncated))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "[CONTEXT SUMMARY — previous conversation compacted due to length]\n{}\n\n[END SUMMARY]\n\nYou are {}. The conversation was compacted. Continue naturally based on the summary and the latest messages below.\n\n{}",
+        summary,
+        agent_name,
+        latest_topic,
+    )
 }
 
 fn load_conversation_history(

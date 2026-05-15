@@ -16,6 +16,8 @@ pub enum ClaudeCliError {
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("Cancelled")]
     Cancelled,
+    #[error("Context overflow: {0}")]
+    ContextOverflow(String),
 }
 
 /// Claude CLI 驱动 - 通过 spawn 本地 claude 命令驱动智能体
@@ -223,7 +225,12 @@ impl ClaudeCli {
                 "[ClaudeCli::invoke] Success, stdout length: {}",
                 stdout.len()
             );
-            Ok(clean_response(&stdout))
+            let cleaned = clean_response(&stdout);
+            if is_context_overflow_text(&cleaned) {
+                log::warn!("[ClaudeCli::invoke] Context overflow detected in response");
+                return Err(ClaudeCliError::ContextOverflow(cleaned));
+            }
+            Ok(cleaned)
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -267,7 +274,12 @@ impl ClaudeCli {
             }
 
             let stdout = String::from_utf8(output.stdout)?;
-            Ok(clean_response(&stdout))
+            let cleaned = clean_response(&stdout);
+            if is_context_overflow_text(&cleaned) {
+                log::warn!("[ClaudeCli::invoke] Context overflow detected in response");
+                return Err(ClaudeCliError::ContextOverflow(cleaned));
+            }
+            Ok(cleaned)
         }
     }
 
@@ -392,7 +404,12 @@ impl ClaudeCli {
                 )));
             }
 
-            Ok(clean_response(&accumulated))
+            let cleaned = clean_response(&accumulated);
+            if is_context_overflow_text(&cleaned) {
+                log::warn!("[ClaudeCli::invoke_streaming] Context overflow detected in response: {}", &cleaned[..cleaned.len().min(200)]);
+                return Err(ClaudeCliError::ContextOverflow(cleaned));
+            }
+            Ok(cleaned)
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -499,7 +516,12 @@ impl ClaudeCli {
                 )));
             }
 
-            Ok(clean_response(&accumulated))
+            let cleaned = clean_response(&accumulated);
+            if is_context_overflow_text(&cleaned) {
+                log::warn!("[ClaudeCli::invoke_streaming] Context overflow detected in response: {}", &cleaned[..cleaned.len().min(200)]);
+                return Err(ClaudeCliError::ContextOverflow(cleaned));
+            }
+            Ok(cleaned)
         }
     }
 
@@ -622,6 +644,21 @@ fn clean_response(raw: &str) -> String {
     } else {
         raw.trim().to_string()
     }
+}
+
+/// Detect context overflow responses from Claude CLI
+/// These come back as normal response text, not as errors
+fn is_context_overflow_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("prompt is too long")
+        || lower.contains("prompt_too_long")
+        || lower.contains("context length exceeded")
+        || lower.contains("context window exceeded")
+        || lower.contains("too many tokens")
+        || lower.contains("token limit exceeded")
+        || lower.contains("request too large")
+        // Also detect very short error-like responses that indicate overflow
+        || (text.len() < 100 && lower.contains("too long"))
 }
 
 fn resolve_launcher_command(config: &AgentConfig, default_env_file: &str) -> String {
