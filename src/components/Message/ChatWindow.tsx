@@ -3,8 +3,10 @@ import { useAgentStore, useChatStore, useConversationStore, useMessageStore, use
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { ACPMessage } from '../../types';
-import type { ChatMessage } from '../../types/chat';
+import type { ChatMessage, ToolCallInfo } from '../../types/chat';
 import ConversationSidebar from './ConversationSidebar';
+
+const INVOKE_TIMEOUT_MS = 620_000; // Slightly longer than backend CLI_TIMEOUT_SECS (600s)
 
 interface GroupChatResult {
   conversationId: string;
@@ -20,10 +22,49 @@ interface GroupChatStreamEvent {
   round?: number | null;
   chunk?: string | null;
   message?: ACPMessage | null;
-  status: 'start' | 'chunk' | 'message' | 'done';
+  status: 'start' | 'chunk' | 'message' | 'tool_use' | 'turn_complete' | 'round_complete' | 'done' | 'cancelled' | 'tool_use_complete';
+  tool_calls?: ToolCallInfo[] | null;
+  phase?: string | null;
 }
 
 const userAddress = 'agent://local/user';
+
+/** Render message text with thinking content styled differently (collapsible) */
+function renderMessageWithThinking(text: string) {
+  const thinkTagRegex = /<thought[^>]*>([\s\S]*?)<\/thought>/gi;
+  const parts = text.split(thinkTagRegex);
+
+  if (parts.length === 1) {
+    // No thinking tags found, render as normal
+    return (
+      <div className="text-sm whitespace-pre-wrap">{text}</div>
+    );
+  }
+
+  // Has thinking content - render with styled thinking blocks
+  return (
+    <div className="text-sm whitespace-pre-wrap">
+      {parts.map((part, idx) => {
+        if (idx % 2 === 1) {
+          // This is thinking content (odd indices after split)
+          return (
+            <details key={idx} className="mt-1 mb-2 rounded bg-gray-800 border border-gray-600">
+              <summary className="cursor-pointer px-2 py-1 text-xs text-gray-400 hover:text-gray-300 flex items-center gap-1">
+                <span className="opacity-50">🤔</span>
+                <span>Thinking...</span>
+              </summary>
+              <div className="px-3 py-2 text-xs text-gray-400 italic border-t border-gray-700">
+                {part.trim()}
+              </div>
+            </details>
+          );
+        }
+        // Regular text content
+        return part ? <span key={idx}>{part}</span> : null;
+      })}
+    </div>
+  );
+}
 
 function getMessageText(message: ACPMessage): string {
   const paramsText = message.content.parameters?.text;
@@ -249,6 +290,8 @@ export default function ChatWindow() {
                 timestamp: new Date().toISOString(),
                 round: payload.round ?? undefined,
                 isLoading: true,
+                phase: 'thinking',
+                toolCalls: null,
               },
             ]);
           }
@@ -264,6 +307,8 @@ export default function ChatWindow() {
                         ...message,
                         text: `${message.text}${payload.chunk}`,
                         isLoading: true,
+                        phase: payload.phase ?? message.phase,
+                        toolCalls: payload.tool_calls ?? message.toolCalls,
                       }
                     : message
                 )
@@ -279,6 +324,8 @@ export default function ChatWindow() {
                   timestamp: new Date().toISOString(),
                   round: payload.round ?? undefined,
                   isLoading: true,
+                  phase: payload.phase ?? null,
+                  toolCalls: payload.tool_calls ?? null,
                 },
               ]);
             }
@@ -298,10 +345,77 @@ export default function ChatWindow() {
             }
           }
 
+          if (payload.status === 'cancelled') {
+            // Stop was pressed and backend confirmed — stop the while loop immediately
+            stopRequestedRef.current = true;
+            console.debug('[cancelled] Stop confirmed by backend, breaking loop');
+          }
+
+          if (payload.status === 'tool_use_complete') {
+            // Agent finished thinking + tool execution (chunk streaming is done)
+            // Turn is now fully complete — this fires BEFORE turn_complete
+            console.debug(`[tool_use_complete] ${payload.speaker} finished thinking + actions`);
+            // Update phase to "acting". Use messageId if available, otherwise speaker.
+            setChatMessages(
+              useChatStore.getState().chatMessages.map((message) =>
+                (payload.messageId ? message.id === payload.messageId : message.sender === payload.speaker) &&
+                message.isLoading
+                  ? { ...message, phase: 'acting', toolCalls: payload.tool_calls ?? message.toolCalls }
+                  : message
+              )
+            );
+          }
+
+          if (payload.status === 'tool_use') {
+            setChatMessages(
+              useChatStore.getState().chatMessages.map((message) =>
+                (payload.messageId ? message.id === payload.messageId : message.sender === payload.speaker) &&
+                message.isLoading
+                  ? {
+                      ...message,
+                      phase: 'acting',
+                      toolCalls: [
+                        ...(message.toolCalls ?? []),
+                        ...(payload.tool_calls ?? []),
+                      ],
+                    }
+                  : message
+              )
+            );
+          }
+
+          if (payload.status === 'turn_complete') {
+            // Agent turn fully done (including tool results incorporated into transcript)
+            console.debug(`[turn_complete] ${payload.speaker} finished round ${payload.round}`);
+            // Use messageId if available, otherwise fall back to speaker match
+            setChatMessages(
+              useChatStore.getState().chatMessages.map((message) =>
+                (payload.messageId ? message.id === payload.messageId : message.sender === payload.speaker) &&
+                message.isLoading
+                  ? { ...message, phase: 'speaking', isLoading: false }
+                  : message
+              )
+            );
+          }
+
+          if (payload.status === 'round_complete') {
+            // Last agent in the round completed — all n agents are done
+            console.debug(`[round_complete] ${payload.speaker} finished round ${payload.round} (last agent)`);
+            // Use messageId if available, otherwise fall back to speaker match
+            setChatMessages(
+              useChatStore.getState().chatMessages.map((message) =>
+                (payload.messageId ? message.id === payload.messageId : message.sender === payload.speaker) &&
+                message.isLoading
+                  ? { ...message, phase: 'speaking', isLoading: false }
+                  : message
+              )
+            );
+          }
+
           if (payload.status === 'done') {
             setChatMessages(
               useChatStore.getState().chatMessages.map((message) =>
-                message.isLoading ? { ...message, isLoading: false } : message
+                message.isLoading ? { ...message, isLoading: false, phase: null } : message
               )
             );
           }
@@ -309,7 +423,9 @@ export default function ChatWindow() {
 
         let result: GroupChatResult | null = null;
         try {
-          result = await invoke<GroupChatResult>('invoke_agent_group_chat_stream', {
+          const { rounds: invokeRounds, chatMode: invokeChatMode } = useChatStore.getState();
+          console.debug(`[invoke] rounds=${invokeRounds}, autoContinue=${useChatStore.getState().autoContinue}, mode=${invokeChatMode}`);
+          const invokePromise = invoke<GroupChatResult>('invoke_agent_group_chat_stream', {
             input: {
               agents: readyAgents.map((agent) => ({
                 id: agent.id,
@@ -319,12 +435,18 @@ export default function ChatWindow() {
                 address: agent.address,
               })),
               message: nextPrompt,
-              rounds,
+              rounds: invokeRounds,
               conversationId: activeConversationId,
               requestId,
-              chatMode,
+              chatMode: invokeChatMode,
             },
           });
+          result = await Promise.race([
+            invokePromise,
+            new Promise<null>((_, reject) =>
+              setTimeout(() => reject(new Error('请求超时，后端响应时间过长')), INVOKE_TIMEOUT_MS)
+            ),
+          ]) as GroupChatResult | null;
         } finally {
           unlisten();
           if (activeRequestIdRef.current === requestId) {
@@ -370,12 +492,17 @@ export default function ChatWindow() {
           await useConversationStore.getState().fetchConversations();
         } catch (_) { /* ignore */ }
 
-        if (!autoContinue) {
+        const {
+          autoContinue: shouldAutoContinue,
+          autoContinueDelay: nextAutoContinueDelay,
+        } = useChatStore.getState();
+        if (!shouldAutoContinue) {
           break;
         }
 
         nextPrompt = '继续这段多智能体对话，基于上一轮内容自然推进，不要结束。';
-        await new Promise((resolve) => setTimeout(resolve, autoContinueDelay));
+        console.debug(`[auto-continue] Triggering next round in ${nextAutoContinueDelay}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, nextAutoContinueDelay));
       }
     } catch (error) {
       setChatMessages(
@@ -535,17 +662,17 @@ export default function ChatWindow() {
               自动续聊
             </label>
             <div className="flex items-center gap-1 text-xs text-gray-400">
-              <span>延时</span>
+              <span>间隔</span>
               <input
                 type="range"
                 min={0}
-                max={5000}
-                step={100}
+                max={10000}
+                step={500}
                 value={autoContinueDelay}
                 onChange={(e) => setAutoContinueDelay(Number(e.target.value))}
                 className="w-20 accent-primary-500"
               />
-              <span className="w-8 text-right">{autoContinueDelay}ms</span>
+              <span className="w-10 text-right">{autoContinueDelay}ms</span>
             </div>
             <div className="flex items-center gap-1 text-xs text-gray-400">
               <span>模式</span>
@@ -596,12 +723,30 @@ export default function ChatWindow() {
                   <span className="text-xs opacity-50">{new Date(msg.timestamp).toLocaleTimeString()}</span>
                 </div>
                 {msg.isLoading ? (
-                  <div className="flex items-center gap-2 text-sm opacity-75">
-                    <span className="animate-pulse">●</span>
-                    {msg.text}
+                  <div className="flex flex-col gap-1 text-sm">
+                    <div className="flex items-center gap-2">
+                      <span className="animate-pulse">●</span>
+                      {msg.text}
+                    </div>
+                    {msg.phase && (
+                      <div className="text-xs opacity-60 italic">
+                        {msg.phase === 'thinking' && '🤔 思考中...'}
+                        {msg.phase === 'acting' && '⚡ 行动中...'}
+                        {msg.phase === 'speaking' && '💬 发言中...'}
+                      </div>
+                    )}
+                    {msg.toolCalls && msg.toolCalls.length > 0 && (
+                      <div className="flex flex-col gap-0.5 mt-1">
+                        {msg.toolCalls.map((tool, i) => (
+                          <div key={i} className="text-xs bg-gray-800 rounded px-2 py-1 font-mono">
+                            🔧 {tool.name}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 ) : (
-                  <div className="text-sm whitespace-pre-wrap">{msg.text}</div>
+                  renderMessageWithThinking(msg.text)
                 )}
               </div>
             </div>
@@ -642,6 +787,7 @@ export default function ChatWindow() {
           </div>
         </div>
       </div>
+
     </div>
   );
 }

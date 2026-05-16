@@ -84,7 +84,10 @@ impl ClaudeSettings {
             .and_then(|c| c.claude_project_dir.as_deref())
             .filter(|v| !v.trim().is_empty());
         let project_dir = resolve_claude_project_dir(agent_project_dir);
-        let env_file = resolve_claude_env_file(&project_dir);
+        let agent_env_file = agent_config
+            .and_then(|c| c.claude_env_file.as_deref())
+            .filter(|v| !v.trim().is_empty());
+        let env_file = resolve_claude_env_file(&project_dir, agent_env_file);
         let entrypoint = resolve_claude_entrypoint(&project_dir);
 
         Self {
@@ -100,15 +103,15 @@ impl ClaudeSettings {
 }
 
 fn resolve_claude_project_dir(agent_project_dir: Option<&str>) -> String {
+    // agent 配置的 claudeProjectDir 优先，避免全局环境变量把不同 provider 串到一起
+    if let Some(dir) = agent_project_dir {
+        return canonicalize_string(dir).unwrap_or_else(|| dir.to_string());
+    }
+
     if let Ok(dir) = std::env::var("ACP_CLAUDE_PROJECT_DIR") {
         if !dir.trim().is_empty() {
             return canonicalize_string(&dir).unwrap_or(dir);
         }
-    }
-
-    // agent 配置的 claudeProjectDir 优先于目录扫描
-    if let Some(dir) = agent_project_dir {
-        return canonicalize_string(dir).unwrap_or_else(|| dir.to_string());
     }
 
     let candidates = [
@@ -127,7 +130,14 @@ fn resolve_claude_project_dir(agent_project_dir: Option<&str>) -> String {
     ".".to_string()
 }
 
-fn resolve_claude_env_file(project_dir: &str) -> String {
+fn resolve_claude_env_file(project_dir: &str, agent_env_file: Option<&str>) -> String {
+    if let Some(file) = agent_env_file {
+        let trimmed = file.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
     if let Ok(file) = std::env::var("ACP_CLAUDE_ENV_FILE") {
         if !file.trim().is_empty() {
             return file;
@@ -138,10 +148,13 @@ fn resolve_claude_env_file(project_dir: &str) -> String {
     if bin_dir.join("claude-haha-dsv4.cmd").exists() || bin_dir.join("claude-haha-dsv4").exists() {
         return ".env.dsv4".to_string();
     }
-    if bin_dir.join("claude-haha-minimax27.cmd").exists() || bin_dir.join("claude-haha-minimax27").exists() {
+    if bin_dir.join("claude-haha-minimax27.cmd").exists()
+        || bin_dir.join("claude-haha-minimax27").exists()
+    {
         return ".env.minimax27".to_string();
     }
-    if bin_dir.join("claude-haha-glm51.cmd").exists() || bin_dir.join("claude-haha-glm51").exists() {
+    if bin_dir.join("claude-haha-glm51.cmd").exists() || bin_dir.join("claude-haha-glm51").exists()
+    {
         return ".env.glm51".to_string();
     }
 

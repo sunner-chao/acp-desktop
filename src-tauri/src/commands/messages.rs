@@ -9,7 +9,9 @@ pub fn send_message(state: State<AppState>, input: SendMessageInput) -> Result<A
     let db = state.db.lock().map_err(|e| e.to_string())?;
 
     let id = Uuid::new_v4().to_string();
-    let conversation_id = input.conversation_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let conversation_id = input
+        .conversation_id
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let timestamp = chrono::Utc::now().to_rfc3339();
 
     let message = ACPMessage {

@@ -65,7 +65,9 @@ pub struct MessageFilter {
 impl ACPMessage {
     pub fn new(input: SendMessageInput) -> Self {
         let id = Uuid::new_v4().to_string();
-        let conversation_id = input.conversation_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let conversation_id = input
+            .conversation_id
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let timestamp = chrono::Utc::now().to_rfc3339();
 
         Self {

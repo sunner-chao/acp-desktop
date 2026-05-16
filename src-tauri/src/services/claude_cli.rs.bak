@@ -1,8 +1,7 @@
 use crate::models::{AgentConfig, ClaudeSettings};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -19,34 +18,6 @@ pub enum ClaudeCliError {
     Cancelled,
     #[error("Context overflow: {0}")]
     ContextOverflow(String),
-}
-
-/// Maximum time (seconds) to wait for a single CLI invocation before killing it
-const CLI_TIMEOUT_SECS: u64 = 600;
-const DEFAULT_CLI_MAX_TURNS: &str = "6";
-
-#[derive(Debug, Clone)]
-pub struct StreamToolCall {
-    pub name: String,
-    pub input: String,
-}
-
-fn max_turns_arg() -> String {
-    std::env::var("ACP_CLAUDE_MAX_TURNS")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .map(|value| value.clamp(1, 20).to_string())
-        .unwrap_or_else(|| DEFAULT_CLI_MAX_TURNS.to_string())
-}
-
-fn resolve_agent_model(config: &AgentConfig) -> Option<&str> {
-    config
-        .claude_model
-        .as_deref()
-        .or(config.model.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .filter(|value| !value.starts_with("http://") && !value.starts_with("https://"))
 }
 
 /// Claude CLI 驱动 - 通过 spawn 本地 claude 命令驱动智能体
@@ -72,14 +43,7 @@ fn resolve_env_file(config: &AgentConfig, default_env_file: &str) -> String {
 }
 
 /// 读取 .env 文件并显式设置到 Command，确保覆盖父进程继承的环境变量
-fn load_env_file_to_command(
-    cmd: &mut Command,
-    project_dir: &str,
-    env_file: &str,
-    config: &AgentConfig,
-) {
-    clear_provider_env(cmd);
-
+fn load_env_file_to_command(cmd: &mut Command, project_dir: &str, env_file: &str) {
     let env_path = std::path::Path::new(project_dir).join(env_file);
     if let Ok(content) = std::fs::read_to_string(&env_path) {
         for line in content.lines() {
@@ -102,67 +66,8 @@ fn load_env_file_to_command(
             env_path.display()
         );
     } else {
-        log::warn!(
-            "[ClaudeCli] Failed to read env file: {}",
-            env_path.display()
-        );
+        log::warn!("[ClaudeCli] Failed to read env file: {}", env_path.display());
     }
-
-    apply_agent_config_to_command(cmd, config);
-}
-
-fn clear_provider_env(cmd: &mut Command) {
-    for key in [
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_MODEL",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-        "ANTHROPIC_DEFAULT_OPUS_MODEL",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "OPENAI_MODEL",
-        "API_TIMEOUT_MS",
-    ] {
-        cmd.env_remove(key);
-    }
-}
-
-fn apply_agent_config_to_command(cmd: &mut Command, config: &AgentConfig) {
-    let endpoint = config
-        .endpoint
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(endpoint) = endpoint {
-        cmd.env("ANTHROPIC_BASE_URL", endpoint);
-    }
-
-    let api_key = config
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(api_key) = api_key {
-        cmd.env("ANTHROPIC_AUTH_TOKEN", api_key);
-        cmd.env("ANTHROPIC_API_KEY", api_key);
-    }
-
-    let model = resolve_agent_model(config);
-    if let Some(model) = model {
-        cmd.env("ANTHROPIC_MODEL", model);
-        cmd.env("ANTHROPIC_DEFAULT_HAIKU_MODEL", model);
-        cmd.env("ANTHROPIC_DEFAULT_OPUS_MODEL", model);
-        cmd.env("ANTHROPIC_DEFAULT_SONNET_MODEL", model);
-    }
-
-    log::info!(
-        "[ClaudeCli] Applied agent-local provider overrides: endpoint={}, api_key={}, model={}",
-        endpoint.is_some(),
-        api_key.is_some(),
-        model.unwrap_or("<env-file>")
-    );
 }
 
 /// 在 Windows 上启动 Claude CLI 子进程，直接调用 bun（绕过 cmd /C 避免 stdin 转发问题）
@@ -170,7 +75,6 @@ fn apply_agent_config_to_command(cmd: &mut Command, config: &AgentConfig) {
 #[cfg(target_os = "windows")]
 fn spawn_cli_process(
     settings: &ClaudeSettings,
-    config: &AgentConfig,
     env_file: &str,
     shared_args: &[&str],
     session_id: Option<&str>,
@@ -184,10 +88,6 @@ fn spawn_cli_process(
     ];
     for arg in shared_args {
         args.push(arg.to_string());
-    }
-    if let Some(model) = resolve_agent_model(config) {
-        args.push("--model".to_string());
-        args.push(model.to_string());
     }
     if let Some(session_id) = session_id {
         if resume_existing {
@@ -222,7 +122,7 @@ fn spawn_cli_process(
     let mut cmd = Command::new(&settings.command);
 
     // 显式加载 env 文件，覆盖父进程继承的污染变量
-    load_env_file_to_command(&mut cmd, &settings.project_dir, env_file, config);
+    load_env_file_to_command(&mut cmd, &settings.project_dir, env_file);
 
     let mut child = cmd
         .args(&args)
@@ -241,7 +141,6 @@ fn spawn_cli_process(
 #[cfg(not(target_os = "windows"))]
 fn spawn_cli_process(
     _settings: &ClaudeSettings,
-    _config: &AgentConfig,
     _env_file: &str,
     _shared_args: &[&str],
     _session_id: Option<&str>,
@@ -274,10 +173,7 @@ impl ClaudeCli {
             system_prompt, message
         );
 
-        log::info!(
-            "[ClaudeCli] Invoking agent, project dir: {}",
-            self.settings.project_dir
-        );
+        log::info!("[ClaudeCli] Invoking agent, project dir: {}", self.settings.project_dir);
         log::info!("[ClaudeCli] Env file: {}", env_file);
         log::debug!("[ClaudeCli] Prompt length: {}", full_prompt.len());
 
@@ -286,32 +182,19 @@ impl ClaudeCli {
         {
             let (mut child, pid) = spawn_cli_process(
                 &self.settings,
-                config,
                 &env_file,
-                &[
-                    "-p",
-                    "--bare",
-                    "--max-turns",
-                    DEFAULT_CLI_MAX_TURNS,
-                    "--dangerously-skip-permissions",
-                ],
+                &["-p", "--bare", "--max-turns", "1", "--dangerously-skip-permissions"],
                 session_id,
                 resume_existing,
                 config.thinking_enabled.unwrap_or(false),
             )?;
 
-            log::info!(
-                "[ClaudeCli::invoke] Writing prompt to stdin ({} bytes)...",
-                full_prompt.len()
-            );
+            log::info!("[ClaudeCli::invoke] Writing prompt to stdin ({} bytes)...", full_prompt.len());
             if let Some(mut stdin) = child.stdin.take() {
                 stdin.write_all(full_prompt.as_bytes())?;
                 // stdin is dropped here, closing the pipe so the child reads EOF
             }
-            log::info!(
-                "[ClaudeCli::invoke] Stdin closed, waiting for process PID={}...",
-                pid
-            );
+            log::info!("[ClaudeCli::invoke] Stdin closed, waiting for process PID={}...", pid);
 
             let output = child.wait_with_output()?;
             let _ = pid;
@@ -352,71 +235,34 @@ impl ClaudeCli {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let max_turns = max_turns_arg();
-            let mut args: Vec<String> = vec![
-                "--env-file".to_string(),
-                env_file.clone(),
-                self.settings.entrypoint.clone(),
-                "-p".to_string(),
-                "--bare".to_string(),
-                "--max-turns".to_string(),
-                max_turns,
-                "--dangerously-skip-permissions".to_string(),
-            ];
-            if let Some(model) = resolve_agent_model(config) {
-                args.push("--model".to_string());
-                args.push(model.to_string());
-            }
-
-            if let Some(sid) = session_id {
-                if resume_existing {
-                    args.push("-r".to_string());
-                    args.push(sid.to_string());
-                } else {
-                    args.push("--session-id".to_string());
-                    args.push(sid.to_string());
-                }
-            }
-
-            log::info!(
-                "[ClaudeCli::invoke] Running: {} {:?}",
-                self.settings.command,
-                args
+            let launcher = resolve_launcher_command(config, &self.settings.env_file);
+            let bash_cmd = format!(
+                "echo '{}' | {} -p --bare --max-turns 1 --dangerously-skip-permissions{}",
+                full_prompt.replace("'", "'\\''"),
+                launcher,
+                session_id.map(|sid| {
+                    if resume_existing {
+                        format!(" -r {}", sid)
+                    } else {
+                        format!(" --session-id {}", sid)
+                    }
+                }).unwrap_or_default()
             );
+            log::info!("[ClaudeCli] Full bash command: {}", bash_cmd);
 
-            let mut cmd = Command::new(&self.settings.command);
-            load_env_file_to_command(&mut cmd, &self.settings.project_dir, &env_file, config);
-            let mut child = cmd
-                .args(&args)
-                .current_dir(&self.settings.project_dir)
+            let mut child = Command::new("bash")
+                .args(["-c", &bash_cmd])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?;
 
-            let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(full_prompt.as_bytes())?;
-            drop(stdin);
-
-            // Wait with timeout to prevent indefinite hangs
-            let pid = child.id();
-            let output_result = child.wait_with_output();
-            let output = match output_result {
-                Ok(o) => o,
-                Err(e) => {
-                    let _ = terminate_session(pid);
-                    return Err(ClaudeCliError::Io(e));
-                }
-            };
+            let output = child.wait_with_output()?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                log::warn!(
-                    "[ClaudeCli] Non-zero exit: stderr={}, stdout={}",
-                    stderr,
-                    stdout
-                );
+                log::warn!("[ClaudeCli] Non-zero exit: stderr={}, stdout={}", stderr, stdout);
                 if !stdout.is_empty() {
                     return Ok(clean_response(&stdout));
                 }
@@ -437,7 +283,7 @@ impl ClaudeCli {
         }
     }
 
-    pub fn invoke_streaming<F, R, U, C, T>(
+    pub fn invoke_streaming<F, R, U, C>(
         &self,
         config: &AgentConfig,
         message: &str,
@@ -448,15 +294,14 @@ impl ClaudeCli {
         on_unpid: U,
         is_cancelled: C,
         mut on_chunk: F,
-        mut on_tool_call: T,
     ) -> Result<String, ClaudeCliError>
     where
         F: FnMut(&str) -> Result<(), ClaudeCliError>,
         R: FnOnce(u32) -> Result<(), ClaudeCliError>,
         U: FnOnce() -> Result<(), ClaudeCliError>,
         C: Fn() -> bool,
-        T: FnMut(StreamToolCall) -> Result<(), ClaudeCliError>,
     {
+        let env_file = resolve_env_file(config, &self.settings.env_file);
         let full_prompt = format!(
             "[System]\n{}\n\n[Incoming ACP Message]\n{}\n\nRespond concisely in character. Keep under 300 words.",
             system_prompt, message
@@ -464,22 +309,10 @@ impl ClaudeCli {
 
         #[cfg(target_os = "windows")]
         {
-            let env_file = resolve_env_file(config, &self.settings.env_file);
             let (mut child, pid) = spawn_cli_process(
                 &self.settings,
-                config,
                 &env_file,
-                &[
-                    "-p",
-                    "--verbose",
-                    "--bare",
-                    "--max-turns",
-                    DEFAULT_CLI_MAX_TURNS,
-                    "--output-format",
-                    "stream-json",
-                    "--include-partial-messages",
-                    "--dangerously-skip-permissions",
-                ],
+                &["-p", "--verbose", "--bare", "--max-turns", "1", "--output-format", "stream-json", "--include-partial-messages", "--dangerously-skip-permissions"],
                 session_id,
                 resume_existing,
                 config.thinking_enabled.unwrap_or(false),
@@ -487,18 +320,12 @@ impl ClaudeCli {
 
             on_pid(pid)?;
 
-            log::info!(
-                "[ClaudeCli::invoke_streaming] Writing prompt to stdin ({} bytes)...",
-                full_prompt.len()
-            );
+            log::info!("[ClaudeCli::invoke_streaming] Writing prompt to stdin ({} bytes)...", full_prompt.len());
             if let Some(mut stdin) = child.stdin.take() {
                 stdin.write_all(full_prompt.as_bytes())?;
                 // stdin dropped here, closing pipe
             }
-            log::info!(
-                "[ClaudeCli::invoke_streaming] Stdin closed, reading stdout from PID={}...",
-                pid
-            );
+            log::info!("[ClaudeCli::invoke_streaming] Stdin closed, reading stdout from PID={}...", pid);
 
             let stderr = child.stderr.take();
             let stderr_handle = stderr.map(|mut stderr| {
@@ -510,7 +337,6 @@ impl ClaudeCli {
             });
 
             let mut accumulated = String::new();
-            let mut seen_tool_calls = std::collections::HashSet::new();
             if let Some(stdout) = child.stdout.take() {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines() {
@@ -524,13 +350,30 @@ impl ClaudeCli {
                         continue;
                     }
 
-                    handle_stream_line(
-                        &line,
-                        &mut accumulated,
-                        &mut seen_tool_calls,
-                        &mut on_chunk,
-                        &mut on_tool_call,
-                    )?;
+                    if let Some(text) = extract_stream_text(&line) {
+                        let (chunk, next_accumulated) = if text.starts_with(&accumulated) {
+                            (text[accumulated.len()..].to_string(), text)
+                        } else {
+                            let mut next = accumulated.clone();
+                            next.push_str(&text);
+                            (text, next)
+                        };
+                        if !chunk.is_empty() {
+                            on_chunk(&chunk)?;
+                        }
+                        accumulated = next_accumulated;
+                    } else if serde_json::from_str::<serde_json::Value>(&line).is_err() {
+                        let cleaned = clean_response(&line);
+                        if !cleaned.is_empty() {
+                            let chunk = if accumulated.is_empty() {
+                                cleaned.clone()
+                            } else {
+                                format!("\n{}", cleaned)
+                            };
+                            on_chunk(&chunk)?;
+                            accumulated.push_str(&chunk);
+                        }
+                    }
                 }
             }
 
@@ -563,10 +406,7 @@ impl ClaudeCli {
 
             let cleaned = clean_response(&accumulated);
             if is_context_overflow_text(&cleaned) {
-                log::warn!(
-                    "[ClaudeCli::invoke_streaming] Context overflow detected in response: {}",
-                    &cleaned[..cleaned.len().min(200)]
-                );
+                log::warn!("[ClaudeCli::invoke_streaming] Context overflow detected in response: {}", &cleaned[..cleaned.len().min(200)]);
                 return Err(ClaudeCliError::ContextOverflow(cleaned));
             }
             Ok(cleaned)
@@ -574,53 +414,32 @@ impl ClaudeCli {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let env_file = resolve_env_file(config, &self.settings.env_file);
-            let max_turns = max_turns_arg();
-            let mut args: Vec<String> = vec![
-                "--env-file".to_string(),
-                env_file.clone(),
-                self.settings.entrypoint.clone(),
-                "-p".to_string(),
-                "--verbose".to_string(),
-                "--bare".to_string(),
-                "--max-turns".to_string(),
-                max_turns,
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--include-partial-messages".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-            ];
-            if let Some(model) = resolve_agent_model(config) {
-                args.push("--model".to_string());
-                args.push(model.to_string());
-            }
-
-            if let Some(sid) = session_id {
+            let launcher = resolve_launcher_command(config, &self.settings.env_file);
+            let session_arg = session_id.map(|sid| {
                 if resume_existing {
-                    args.push("-r".to_string());
-                    args.push(sid.to_string());
+                    format!(" -r {}", sid)
                 } else {
-                    args.push("--session-id".to_string());
-                    args.push(sid.to_string());
+                    format!(" --session-id {}", sid)
                 }
-            }
+            }).unwrap_or_default();
 
-            if config.thinking_enabled.unwrap_or(false) {
-                args.push("--thinking".to_string());
-                args.push("enabled".to_string());
-            }
+            let thinking_arg = if config.thinking_enabled.unwrap_or(false) {
+                " --thinking enabled"
+            } else {
+                ""
+            };
 
-            log::info!(
-                "[ClaudeCli::invoke_streaming] Running: {} {:?}",
-                self.settings.command,
-                args
+            let bash_cmd = format!(
+                "echo '{}' | {} -p --verbose --bare --max-turns 1 --output-format stream-json --include-partial-messages --dangerously-skip-permissions{}{}",
+                full_prompt.replace("'", "'\\''"),
+                launcher,
+                session_arg,
+                thinking_arg
             );
+            log::info!("[ClaudeCli] Full bash command: {}", bash_cmd);
 
-            let mut cmd = Command::new(&self.settings.command);
-            load_env_file_to_command(&mut cmd, &self.settings.project_dir, &env_file, config);
-            let mut child = cmd
-                .args(&args)
-                .current_dir(&self.settings.project_dir)
+            let mut child = Command::new("bash")
+                .args(["-c", &bash_cmd])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -628,18 +447,6 @@ impl ClaudeCli {
 
             let pid = child.id();
             let _ = on_pid(pid);
-
-            log::info!(
-                "[ClaudeCli::invoke_streaming] Writing prompt to stdin ({} bytes)...",
-                full_prompt.len()
-            );
-            let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(full_prompt.as_bytes())?;
-            drop(stdin);
-            log::info!(
-                "[ClaudeCli::invoke_streaming] Stdin closed, reading stdout from PID={}...",
-                pid
-            );
 
             let stderr = child.stderr.take();
             let stderr_handle = stderr.map(|mut stderr| {
@@ -650,81 +457,45 @@ impl ClaudeCli {
                 })
             });
 
-            // Read stdout lines in a separate thread, send via channel to allow timeout
-            let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
-            let stdout_reader = child.stdout.take();
-            let reader_cancelled = Arc::new(Mutex::new(false));
-            let reader_cancelled_clone = Arc::clone(&reader_cancelled);
-
-            let reader_handle = stdout_reader.map(move |stdout| {
-                std::thread::spawn(move || {
-                    let reader = BufReader::new(stdout);
-                    for line in reader.lines() {
-                        if *reader_cancelled.lock().unwrap() {
-                            break;
-                        }
-                        match line {
-                            Ok(l) => {
-                                if line_tx.send(l).is_err() {
-                                    break; // receiver dropped
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                })
-            });
-
             let mut accumulated = String::new();
-            let mut seen_tool_calls = std::collections::HashSet::new();
-            let timeout = Duration::from_secs(CLI_TIMEOUT_SECS);
-            let mut last_activity = std::time::Instant::now();
-
-            loop {
-                if is_cancelled() {
-                    let _ = terminate_session(pid);
-                    *reader_cancelled_clone.lock().unwrap() = true;
-                    break;
-                }
-
-                match line_rx.recv_timeout(Duration::from_secs(5)) {
-                    Ok(line) => {
-                        last_activity = std::time::Instant::now();
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-
-                        handle_stream_line(
-                            &line,
-                            &mut accumulated,
-                            &mut seen_tool_calls,
-                            &mut on_chunk,
-                            &mut on_tool_call,
-                        )?;
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        // Check if we've exceeded the overall timeout
-                        if last_activity.elapsed() > timeout {
-                            log::warn!(
-                                "[ClaudeCli::invoke_streaming] Timeout ({})s reached for PID={}, killing process",
-                                CLI_TIMEOUT_SECS, pid
-                            );
-                            let _ = terminate_session(pid);
-                            *reader_cancelled_clone.lock().unwrap() = true;
-                            break;
-                        }
-                        // Otherwise just continue waiting
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        // Reader thread finished (stdout closed)
+            if let Some(stdout) = child.stdout.take() {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    if is_cancelled() {
+                        let _ = terminate_session(pid);
                         break;
                     }
-                }
-            }
 
-            // Wait for reader thread to finish
-            if let Some(handle) = reader_handle {
-                let _ = handle.join();
+                    let line = line?;
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+
+                    if let Some(text) = extract_stream_text(&line) {
+                        let (chunk, next_accumulated) = if text.starts_with(&accumulated) {
+                            (text[accumulated.len()..].to_string(), text)
+                        } else {
+                            let mut next = accumulated.clone();
+                            next.push_str(&text);
+                            (text, next)
+                        };
+                        if !chunk.is_empty() {
+                            on_chunk(&chunk)?;
+                        }
+                        accumulated = next_accumulated;
+                    } else if serde_json::from_str::<serde_json::Value>(&line).is_err() {
+                        let cleaned = clean_response(&line);
+                        if !cleaned.is_empty() {
+                            let chunk = if accumulated.is_empty() {
+                                cleaned.clone()
+                            } else {
+                                format!("\n{}", cleaned)
+                            };
+                            on_chunk(&chunk)?;
+                            accumulated.push_str(&chunk);
+                        }
+                    }
+                }
             }
 
             let output_status = child.wait()?;
@@ -737,11 +508,6 @@ impl ClaudeCli {
                 return Err(ClaudeCliError::Cancelled);
             }
 
-            // Check if we timed out
-            if last_activity.elapsed() > timeout && accumulated.trim().is_empty() {
-                return Err(ClaudeCliError::Timeout);
-            }
-
             if !output_status.success() && accumulated.trim().is_empty() {
                 return Err(ClaudeCliError::Process(format!(
                     "Exit code {}: {}",
@@ -752,10 +518,7 @@ impl ClaudeCli {
 
             let cleaned = clean_response(&accumulated);
             if is_context_overflow_text(&cleaned) {
-                log::warn!(
-                    "[ClaudeCli::invoke_streaming] Context overflow detected in response: {}",
-                    &cleaned[..cleaned.len().min(200)]
-                );
+                log::warn!("[ClaudeCli::invoke_streaming] Context overflow detected in response: {}", &cleaned[..cleaned.len().min(200)]);
                 return Err(ClaudeCliError::ContextOverflow(cleaned));
             }
             Ok(cleaned)
@@ -806,128 +569,13 @@ impl ClaudeCli {
     }
 }
 
-fn handle_stream_line<F, T>(
-    raw_line: &str,
-    accumulated: &mut String,
-    seen_tool_calls: &mut std::collections::HashSet<String>,
-    on_chunk: &mut F,
-    on_tool_call: &mut T,
-) -> Result<(), ClaudeCliError>
-where
-    F: FnMut(&str) -> Result<(), ClaudeCliError>,
-    T: FnMut(StreamToolCall) -> Result<(), ClaudeCliError>,
-{
-    for tool_call in extract_tool_calls(raw_line) {
-        let key = format!("{}:{}", tool_call.name, tool_call.input);
-        if seen_tool_calls.insert(key) {
-            on_tool_call(tool_call)?;
-        }
-    }
-
-    if let Some(text) = extract_stream_text(raw_line) {
-        let (chunk, next_accumulated) = if text.starts_with(accumulated.as_str()) {
-            (text[accumulated.len()..].to_string(), text)
-        } else {
-            let mut next = accumulated.clone();
-            next.push_str(&text);
-            (text, next)
-        };
-        if !chunk.is_empty() {
-            on_chunk(&chunk)?;
-        }
-        *accumulated = next_accumulated;
-    } else if serde_json::from_str::<serde_json::Value>(raw_line).is_err() {
-        let cleaned = clean_response(raw_line);
-        if !cleaned.is_empty() {
-            let chunk = if accumulated.is_empty() {
-                cleaned.clone()
-            } else {
-                format!("\n{}", cleaned)
-            };
-            on_chunk(&chunk)?;
-            accumulated.push_str(&chunk);
-        }
-    }
-
-    Ok(())
-}
-
-fn extract_tool_calls(raw_line: &str) -> Vec<StreamToolCall> {
-    let value: serde_json::Value = match serde_json::from_str(raw_line) {
-        Ok(value) => value,
-        Err(_) => return Vec::new(),
-    };
-    let mut calls = Vec::new();
-    collect_tool_calls(&value, &mut calls);
-    calls
-}
-
-fn collect_tool_calls(value: &serde_json::Value, calls: &mut Vec<StreamToolCall>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            let is_tool_use = map
-                .get("type")
-                .and_then(|v| v.as_str())
-                .is_some_and(|kind| kind == "tool_use" || kind == "server_tool_use");
-            if is_tool_use {
-                if let Some(name) = map.get("name").and_then(|v| v.as_str()) {
-                    let input = map
-                        .get("input")
-                        .map(|v| {
-                            if let Some(s) = v.as_str() {
-                                s.to_string()
-                            } else {
-                                v.to_string()
-                            }
-                        })
-                        .unwrap_or_default();
-                    calls.push(StreamToolCall {
-                        name: name.to_string(),
-                        input,
-                    });
-                }
-            }
-
-            if let Some(content_block) = map.get("content_block") {
-                collect_tool_calls(content_block, calls);
-            }
-            if let Some(message) = map.get("message") {
-                collect_tool_calls(message, calls);
-            }
-            if let Some(content) = map.get("content") {
-                collect_tool_calls(content, calls);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_tool_calls(item, calls);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn extract_stream_text(raw_line: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(raw_line).ok()?;
 
-    // Skip non-content event types — these describe tool calls, not visible text output.
-    // Without this, tool call JSON blobs get sent as text chunks and pollute the agent's reply.
     if value
         .get("type")
         .and_then(|v| v.as_str())
-        .is_some_and(|kind| {
-            matches!(
-                kind,
-                "result"
-                    | "system"
-                    | "tool_use"
-                    | "input_required"
-                    | "hook"
-                    | "usage"
-                    | "ping"
-                    | "error"
-            )
-        })
+        .is_some_and(|kind| kind == "result" || kind == "system")
     {
         return None;
     }

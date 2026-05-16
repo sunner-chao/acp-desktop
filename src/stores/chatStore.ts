@@ -44,7 +44,7 @@ export const useChatStore = create<ChatState>()(
       isSending: false,
       isStopping: false,
       autoContinue: false,
-      autoContinueDelay: 600,
+      autoContinueDelay: 3000, // 3 seconds between agent turns in sequential mode
       chatMode: 'sequential',
       conversationCache: {},
 
@@ -117,7 +117,7 @@ export const useChatStore = create<ChatState>()(
           isSending: false,
           isStopping: false,
           autoContinue: false,
-          autoContinueDelay: 600,
+          autoContinueDelay: 3000,
           chatMode: 'sequential',
           conversationCache: {},
         }),
