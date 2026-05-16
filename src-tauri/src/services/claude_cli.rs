@@ -24,6 +24,8 @@ pub enum ClaudeCliError {
 /// Maximum time (seconds) to wait for a single CLI invocation before killing it
 const CLI_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_CLI_MAX_TURNS: &str = "6";
+const DEFAULT_ADAPTIVE_MIN_TURNS: u32 = 3;
+const DEFAULT_ADAPTIVE_MAX_TURNS: u32 = 12;
 
 #[derive(Debug, Clone)]
 pub struct StreamToolCall {
@@ -31,12 +33,96 @@ pub struct StreamToolCall {
     pub input: String,
 }
 
-fn max_turns_arg() -> String {
+fn configured_turn_bound(key: &str, fallback: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(|value| value.clamp(1, 20))
+        .unwrap_or(fallback)
+}
+
+fn fixed_max_turns_arg() -> Option<String> {
     std::env::var("ACP_CLAUDE_MAX_TURNS")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .map(|value| value.clamp(1, 20).to_string())
-        .unwrap_or_else(|| DEFAULT_CLI_MAX_TURNS.to_string())
+}
+
+fn adaptive_max_turns_arg(
+    config: &AgentConfig,
+    message: &str,
+    system_prompt: &str,
+    resume_existing: bool,
+    streaming: bool,
+) -> String {
+    if let Some(fixed) = fixed_max_turns_arg() {
+        return fixed;
+    }
+
+    let min_turns = configured_turn_bound("ACP_CLAUDE_MIN_TURNS", DEFAULT_ADAPTIVE_MIN_TURNS);
+    let max_turns =
+        configured_turn_bound("ACP_CLAUDE_ADAPTIVE_MAX_TURNS", DEFAULT_ADAPTIVE_MAX_TURNS)
+            .max(min_turns);
+    let combined_len = message.len() + system_prompt.len();
+    let task_text = format!("{} {}", message, system_prompt).to_lowercase();
+
+    let mut budget = DEFAULT_CLI_MAX_TURNS
+        .parse::<u32>()
+        .unwrap_or(DEFAULT_ADAPTIVE_MIN_TURNS);
+
+    if streaming {
+        budget += 1;
+    }
+    if resume_existing {
+        budget += 1;
+    }
+    if config.thinking_enabled.unwrap_or(false) {
+        budget += 1;
+    }
+    if combined_len > 8_000 {
+        budget += 1;
+    }
+    if combined_len > 20_000 {
+        budget += 2;
+    }
+    if combined_len > 45_000 {
+        budget += 2;
+    }
+    if task_text.contains("工具")
+        || task_text.contains("tool")
+        || task_text.contains("文件")
+        || task_text.contains("日志")
+        || task_text.contains("测试")
+        || task_text.contains("构建")
+        || task_text.contains("运行")
+        || task_text.contains("修复")
+        || task_text.contains("实现")
+        || task_text.contains("检查")
+        || task_text.contains("查看")
+        || task_text.contains("代码")
+        || task_text.contains("repo")
+        || task_text.contains("build")
+        || task_text.contains("test")
+        || task_text.contains("fix")
+        || task_text.contains("implement")
+        || task_text.contains("debug")
+        || task_text.contains("log")
+    {
+        budget += 2;
+    }
+
+    let clamped = budget.clamp(min_turns, max_turns);
+    log::info!(
+        "[ClaudeCli] Adaptive max-turns={}, prompt_chars={}, resume={}, streaming={}, thinking={}, bounds={}..{}",
+        clamped,
+        combined_len,
+        resume_existing,
+        streaming,
+        config.thinking_enabled.unwrap_or(false),
+        min_turns,
+        max_turns
+    );
+    clamped.to_string()
 }
 
 fn resolve_agent_model(config: &AgentConfig) -> Option<&str> {
@@ -172,7 +258,7 @@ fn spawn_cli_process(
     settings: &ClaudeSettings,
     config: &AgentConfig,
     env_file: &str,
-    shared_args: &[&str],
+    shared_args: &[String],
     session_id: Option<&str>,
     resume_existing: bool,
     thinking_enabled: bool,
@@ -182,9 +268,7 @@ fn spawn_cli_process(
         env_file.to_string(),
         settings.entrypoint.clone(),
     ];
-    for arg in shared_args {
-        args.push(arg.to_string());
-    }
+    args.extend(shared_args.iter().cloned());
     if let Some(model) = resolve_agent_model(config) {
         args.push("--model".to_string());
         args.push(model.to_string());
@@ -243,7 +327,7 @@ fn spawn_cli_process(
     _settings: &ClaudeSettings,
     _config: &AgentConfig,
     _env_file: &str,
-    _shared_args: &[&str],
+    _shared_args: &[String],
     _session_id: Option<&str>,
     _resume_existing: bool,
     _thinking_enabled: bool,
@@ -284,17 +368,20 @@ impl ClaudeCli {
         // 检测操作系统，使用正确的命令格式
         #[cfg(target_os = "windows")]
         {
+            let max_turns =
+                adaptive_max_turns_arg(config, message, system_prompt, resume_existing, false);
+            let shared_args = vec![
+                "-p".to_string(),
+                "--bare".to_string(),
+                "--max-turns".to_string(),
+                max_turns,
+                "--dangerously-skip-permissions".to_string(),
+            ];
             let (mut child, pid) = spawn_cli_process(
                 &self.settings,
                 config,
                 &env_file,
-                &[
-                    "-p",
-                    "--bare",
-                    "--max-turns",
-                    DEFAULT_CLI_MAX_TURNS,
-                    "--dangerously-skip-permissions",
-                ],
+                &shared_args,
                 session_id,
                 resume_existing,
                 config.thinking_enabled.unwrap_or(false),
@@ -352,7 +439,8 @@ impl ClaudeCli {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let max_turns = max_turns_arg();
+            let max_turns =
+                adaptive_max_turns_arg(config, message, system_prompt, resume_existing, false);
             let mut args: Vec<String> = vec![
                 "--env-file".to_string(),
                 env_file.clone(),
@@ -465,21 +553,24 @@ impl ClaudeCli {
         #[cfg(target_os = "windows")]
         {
             let env_file = resolve_env_file(config, &self.settings.env_file);
+            let max_turns =
+                adaptive_max_turns_arg(config, message, system_prompt, resume_existing, true);
+            let shared_args = vec![
+                "-p".to_string(),
+                "--verbose".to_string(),
+                "--bare".to_string(),
+                "--max-turns".to_string(),
+                max_turns,
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--include-partial-messages".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ];
             let (mut child, pid) = spawn_cli_process(
                 &self.settings,
                 config,
                 &env_file,
-                &[
-                    "-p",
-                    "--verbose",
-                    "--bare",
-                    "--max-turns",
-                    DEFAULT_CLI_MAX_TURNS,
-                    "--output-format",
-                    "stream-json",
-                    "--include-partial-messages",
-                    "--dangerously-skip-permissions",
-                ],
+                &shared_args,
                 session_id,
                 resume_existing,
                 config.thinking_enabled.unwrap_or(false),
@@ -575,7 +666,8 @@ impl ClaudeCli {
         #[cfg(not(target_os = "windows"))]
         {
             let env_file = resolve_env_file(config, &self.settings.env_file);
-            let max_turns = max_turns_arg();
+            let max_turns =
+                adaptive_max_turns_arg(config, message, system_prompt, resume_existing, true);
             let mut args: Vec<String> = vec![
                 "--env-file".to_string(),
                 env_file.clone(),
