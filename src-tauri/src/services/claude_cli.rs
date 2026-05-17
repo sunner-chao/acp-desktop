@@ -1,5 +1,6 @@
 use crate::models::{AgentConfig, ClaudeSettings};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,8 +25,9 @@ pub enum ClaudeCliError {
 /// Maximum time (seconds) to wait for a single CLI invocation before killing it
 const CLI_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_CLI_MAX_TURNS: &str = "6";
-const DEFAULT_ADAPTIVE_MIN_TURNS: u32 = 3;
-const DEFAULT_ADAPTIVE_MAX_TURNS: u32 = 12;
+const DEFAULT_ADAPTIVE_MIN_TURNS: u32 = 10;
+const DEFAULT_ADAPTIVE_MAX_TURNS: u32 = 50;
+const ABSOLUTE_MAX_TURNS: u32 = 50;
 
 #[derive(Debug, Clone)]
 pub struct StreamToolCall {
@@ -37,7 +39,7 @@ fn configured_turn_bound(key: &str, fallback: u32) -> u32 {
     std::env::var(key)
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
-        .map(|value| value.clamp(1, 20))
+        .map(|value| value.clamp(1, ABSOLUTE_MAX_TURNS))
         .unwrap_or(fallback)
 }
 
@@ -45,7 +47,7 @@ fn fixed_max_turns_arg() -> Option<String> {
     std::env::var("ACP_CLAUDE_MAX_TURNS")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
-        .map(|value| value.clamp(1, 20).to_string())
+        .map(|value| value.clamp(1, ABSOLUTE_MAX_TURNS).to_string())
 }
 
 fn adaptive_max_turns_arg(
@@ -135,6 +137,50 @@ fn resolve_agent_model(config: &AgentConfig) -> Option<&str> {
         .filter(|value| !value.starts_with("http://") && !value.starts_with("https://"))
 }
 
+fn setting_sources_arg() -> Option<String> {
+    let sources =
+        std::env::var("ACP_CLAUDE_SETTING_SOURCES").unwrap_or_else(|_| "project,local".to_string());
+    let trimmed = sources.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(format!("--setting-sources={trimmed}"))
+    }
+}
+
+fn append_common_cli_args(args: &mut Vec<String>) {
+    if let Some(setting_sources) = setting_sources_arg() {
+        args.push(setting_sources);
+    }
+}
+
+fn isolated_config_dir(project_dir: &str, env_file: &str, config: &AgentConfig) -> PathBuf {
+    let model = resolve_agent_model(config).unwrap_or("default-model");
+    let endpoint = config.endpoint.as_deref().unwrap_or("default-endpoint");
+    let raw = format!("{env_file}-{model}-{endpoint}");
+    let namespace = sanitize_namespace(&raw);
+    Path::new(project_dir)
+        .join(".acp-claude-config")
+        .join(namespace)
+}
+
+fn sanitize_namespace(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.chars().take(96).collect()
+    }
+}
+
 /// Claude CLI 驱动 - 通过 spawn 本地 claude 命令驱动智能体
 pub struct ClaudeCli {
     settings: ClaudeSettings,
@@ -165,8 +211,10 @@ fn load_env_file_to_command(
     config: &AgentConfig,
 ) {
     clear_provider_env(cmd);
+    configure_process_isolation(cmd, project_dir, env_file, config);
 
     let env_path = std::path::Path::new(project_dir).join(env_file);
+    let mut env_provides_auth = false;
     if let Ok(content) = std::fs::read_to_string(&env_path) {
         for line in content.lines() {
             let trimmed = line.trim();
@@ -179,6 +227,9 @@ fn load_env_file_to_command(
                 let key = trimmed[..eq_pos].trim();
                 let value = trimmed[eq_pos + 1..].trim();
                 if !key.is_empty() {
+                    if matches!(key, "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY") {
+                        env_provides_auth = !value.is_empty();
+                    }
                     cmd.env(key, value);
                 }
             }
@@ -194,7 +245,7 @@ fn load_env_file_to_command(
         );
     }
 
-    apply_agent_config_to_command(cmd, config);
+    apply_agent_config_to_command(cmd, config, env_provides_auth);
 }
 
 fn clear_provider_env(cmd: &mut Command) {
@@ -215,7 +266,44 @@ fn clear_provider_env(cmd: &mut Command) {
     }
 }
 
-fn apply_agent_config_to_command(cmd: &mut Command, config: &AgentConfig) {
+fn configure_process_isolation(
+    cmd: &mut Command,
+    project_dir: &str,
+    env_file: &str,
+    config: &AgentConfig,
+) {
+    cmd.env("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1");
+
+    if std::env::var("ACP_CLAUDE_SHARED_CONFIG_DIR")
+        .map(|value| {
+            matches!(
+                value.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let config_dir = isolated_config_dir(project_dir, env_file, config);
+    if let Err(error) = std::fs::create_dir_all(&config_dir) {
+        log::warn!(
+            "[ClaudeCli] Failed to create isolated CLAUDE_CONFIG_DIR {}: {}",
+            config_dir.display(),
+            error
+        );
+        return;
+    }
+
+    cmd.env("CLAUDE_CONFIG_DIR", &config_dir);
+    log::info!(
+        "[ClaudeCli] Using isolated CLAUDE_CONFIG_DIR: {}",
+        config_dir.display()
+    );
+}
+
+fn apply_agent_config_to_command(cmd: &mut Command, config: &AgentConfig, env_provides_auth: bool) {
     let endpoint = config
         .endpoint
         .as_deref()
@@ -230,7 +318,7 @@ fn apply_agent_config_to_command(cmd: &mut Command, config: &AgentConfig) {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if let Some(api_key) = api_key {
+    if let Some(api_key) = api_key.filter(|_| !env_provides_auth) {
         cmd.env("ANTHROPIC_AUTH_TOKEN", api_key);
         cmd.env("ANTHROPIC_API_KEY", api_key);
     }
@@ -246,7 +334,7 @@ fn apply_agent_config_to_command(cmd: &mut Command, config: &AgentConfig) {
     log::info!(
         "[ClaudeCli] Applied agent-local provider overrides: endpoint={}, api_key={}, model={}",
         endpoint.is_some(),
-        api_key.is_some(),
+        api_key.is_some() && !env_provides_auth,
         model.unwrap_or("<env-file>")
     );
 }
@@ -268,6 +356,7 @@ fn spawn_cli_process(
         env_file.to_string(),
         settings.entrypoint.clone(),
     ];
+    append_common_cli_args(&mut args);
     args.extend(shared_args.iter().cloned());
     if let Some(model) = resolve_agent_model(config) {
         args.push("--model".to_string());
@@ -445,12 +534,15 @@ impl ClaudeCli {
                 "--env-file".to_string(),
                 env_file.clone(),
                 self.settings.entrypoint.clone(),
+            ];
+            append_common_cli_args(&mut args);
+            args.extend([
                 "-p".to_string(),
                 "--bare".to_string(),
                 "--max-turns".to_string(),
                 max_turns,
                 "--dangerously-skip-permissions".to_string(),
-            ];
+            ]);
             if let Some(model) = resolve_agent_model(config) {
                 args.push("--model".to_string());
                 args.push(model.to_string());
@@ -672,6 +764,9 @@ impl ClaudeCli {
                 "--env-file".to_string(),
                 env_file.clone(),
                 self.settings.entrypoint.clone(),
+            ];
+            append_common_cli_args(&mut args);
+            args.extend([
                 "-p".to_string(),
                 "--verbose".to_string(),
                 "--bare".to_string(),
@@ -681,7 +776,7 @@ impl ClaudeCli {
                 "stream-json".to_string(),
                 "--include-partial-messages".to_string(),
                 "--dangerously-skip-permissions".to_string(),
-            ];
+            ]);
             if let Some(model) = resolve_agent_model(config) {
                 args.push("--model".to_string());
                 args.push(model.to_string());

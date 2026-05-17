@@ -13,3 +13,4 @@ build/certs/*.crt
 build/certs/*.key
 build/certs/*.pfx
 src-tauri/target/
+.acp-claude-config/
