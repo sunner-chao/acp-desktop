@@ -5,6 +5,12 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:default",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:webview:default",
+    "core:webview:allow-set-webview-focus",
+    "core:event:default",
     "shell:allow-open",
     "shell:allow-execute"
   ]

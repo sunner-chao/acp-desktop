@@ -215,6 +215,8 @@ fn load_env_file_to_command(
 
     let env_path = std::path::Path::new(project_dir).join(env_file);
     let mut env_provides_auth = false;
+    let mut env_auth_token: Option<String> = None;
+    let mut env_has_api_key = false;
     if let Ok(content) = std::fs::read_to_string(&env_path) {
         for line in content.lines() {
             let trimmed = line.trim();
@@ -227,8 +229,14 @@ fn load_env_file_to_command(
                 let key = trimmed[..eq_pos].trim();
                 let value = trimmed[eq_pos + 1..].trim();
                 if !key.is_empty() {
-                    if matches!(key, "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY") {
-                        env_provides_auth = !value.is_empty();
+                    if matches!(key, "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY") && !value.is_empty() {
+                        env_provides_auth = true;
+                    }
+                    if key == "ANTHROPIC_AUTH_TOKEN" && !value.is_empty() {
+                        env_auth_token = Some(value.to_string());
+                    }
+                    if key == "ANTHROPIC_API_KEY" {
+                        env_has_api_key = !value.is_empty();
                     }
                     cmd.env(key, value);
                 }
@@ -245,7 +253,7 @@ fn load_env_file_to_command(
         );
     }
 
-    apply_agent_config_to_command(cmd, config, env_provides_auth);
+    apply_agent_config_to_command(cmd, config, env_provides_auth, env_auth_token.as_deref(), env_has_api_key);
 }
 
 fn clear_provider_env(cmd: &mut Command) {
@@ -303,7 +311,13 @@ fn configure_process_isolation(
     );
 }
 
-fn apply_agent_config_to_command(cmd: &mut Command, config: &AgentConfig, env_provides_auth: bool) {
+fn apply_agent_config_to_command(
+    cmd: &mut Command,
+    config: &AgentConfig,
+    env_provides_auth: bool,
+    env_auth_token: Option<&str>,
+    env_has_api_key: bool,
+) {
     let endpoint = config
         .endpoint
         .as_deref()
@@ -318,7 +332,36 @@ fn apply_agent_config_to_command(cmd: &mut Command, config: &AgentConfig, env_pr
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    if let Some(api_key) = api_key.filter(|_| !env_provides_auth) {
+
+    // Case 1: env file provides auth AND agent config has apiKey
+    //   - Use env file's ANTHROPIC_AUTH_TOKEN for bearer auth
+    //   - BUT ensure ANTHROPIC_API_KEY is also set (required in --bare mode)
+    //   - If env file only has ANTHROPIC_AUTH_TOKEN without ANTHROPIC_API_KEY,
+    //     sync ANTHROPIC_API_KEY = ANTHROPIC_AUTH_TOKEN so the SDK's x-api-key header works
+    // Case 2: env file provides auth, no agent apiKey
+    //   - Same sync logic: ensure ANTHROPIC_API_KEY mirrors ANTHROPIC_AUTH_TOKEN
+    // Case 3: no env auth, agent config has apiKey
+    //   - Set both ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY from config
+    if env_provides_auth {
+        // Env file provides auth token. Ensure ANTHROPIC_API_KEY is also set
+        // because the Claude CLI in --bare mode only reads ANTHROPIC_API_KEY for
+        // the x-api-key header (ANTHROPIC_AUTH_TOKEN is only used for Authorization: Bearer).
+        // Third-party API providers may only check x-api-key.
+        if !env_has_api_key {
+            if let Some(config_key) = api_key {
+                cmd.env("ANTHROPIC_API_KEY", config_key);
+                log::info!(
+                    "[ClaudeCli] Synced ANTHROPIC_API_KEY from agent config (env file only had ANTHROPIC_AUTH_TOKEN)"
+                );
+            } else if let Some(token) = env_auth_token {
+                cmd.env("ANTHROPIC_API_KEY", token);
+                log::info!(
+                    "[ClaudeCli] Synced ANTHROPIC_API_KEY from ANTHROPIC_AUTH_TOKEN (env file had no ANTHROPIC_API_KEY)"
+                );
+            }
+        }
+    } else if let Some(api_key) = api_key {
+        // No env auth; use agent config's apiKey for both
         cmd.env("ANTHROPIC_AUTH_TOKEN", api_key);
         cmd.env("ANTHROPIC_API_KEY", api_key);
     }
@@ -331,11 +374,18 @@ fn apply_agent_config_to_command(cmd: &mut Command, config: &AgentConfig, env_pr
         cmd.env("ANTHROPIC_DEFAULT_SONNET_MODEL", model);
     }
 
+    let effective_api_key = if env_provides_auth {
+        api_key.or(env_auth_token)
+    } else {
+        api_key
+    };
     log::info!(
-        "[ClaudeCli] Applied agent-local provider overrides: endpoint={}, api_key={}, model={}",
+        "[ClaudeCli] Applied agent-local provider overrides: endpoint={}, api_key={}, model={}, env_auth={}, synced_api_key={}",
         endpoint.is_some(),
-        api_key.is_some() && !env_provides_auth,
-        model.unwrap_or("<env-file>")
+        effective_api_key.is_some(),
+        model.unwrap_or("<env-file>"),
+        env_provides_auth,
+        !env_has_api_key && (api_key.is_some() || env_auth_token.is_some()),
     );
 }
 
