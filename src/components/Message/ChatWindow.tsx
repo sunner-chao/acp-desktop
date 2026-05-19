@@ -275,6 +275,10 @@ export default function ChatWindow() {
           const payload = event.payload;
           if (payload.requestId !== requestId) return;
 
+          // Skip all chunk/event processing once stop is requested
+          // to prevent UI from reverting after we've already shown the stop effect
+          if (stopRequestedRef.current) return;
+
           if (payload.conversationId) {
             setConversationId(payload.conversationId);
           }
@@ -525,6 +529,17 @@ export default function ChatWindow() {
   const handleStop = async () => {
     stopRequestedRef.current = true;
     setIsStopping(true);
+
+    // Immediately update UI — mark all loading messages as finished
+    // so the user sees the stop take effect instantly
+    setChatMessages(
+      useChatStore.getState().chatMessages.map((message) =>
+        message.isLoading
+          ? { ...message, isLoading: false }
+          : message
+      )
+    );
+
     const requestId = activeRequestIdRef.current;
     if (!requestId) return;
     try {
